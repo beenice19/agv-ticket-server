@@ -2,11 +2,11 @@
   "name": "stro-chievery-server",
   "version": "1.0.0",
   "description": "Stro Cheivery backend server",
-  "main": "index.js",
   "scripts": {
-    "start": "node index.js",
-    "server": "node index.js"
-  },
+  "start": "node index.js",
+  "server": "node index.js",
+  "ticket": "node ticket-server.js"
+},
   "dependencies": {
     "@supabase/supabase-js": "^2.104.1",
     "bcryptjs": "^3.0.3",
