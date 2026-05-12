@@ -4,3 +4,20 @@ stro-cheivery-users.json
 stro-cheivery-data.json
 stage-uploads
 *.log
+.env
+# AGV local data files - do not commit customer/test data
+agv-*.json
+stro-cheivery-*.json
+
+# AGV local backup files
+*.BEFORE-*.js
+*.GOLD-STABLE*.js
+*.BACKUP*.js
+*-BACKUP*.js
+
+# Stripe helper scripts used for local setup
+create-stripe-prices.js
+create-stripe-internal-test-price.js
+# AGV environment backups - do not commit secrets
+.env-*
+.env.*
