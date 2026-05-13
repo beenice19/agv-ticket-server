@@ -3,10 +3,10 @@
   "version": "1.0.0",
   "description": "Stro Cheivery backend server",
   "scripts": {
-  "start": "node index.js",
-  "server": "node index.js",
-  "ticket": "node ticket-server.js"
-},
+    "start": "node index.js",
+    "server": "node index.js",
+    "ticket": "node ticket-server.js"
+  },
   "dependencies": {
     "@supabase/supabase-js": "^2.104.1",
     "bcryptjs": "^3.0.3",
@@ -17,6 +17,6 @@
     "livekit-server-sdk": "^2.15.2",
     "multer": "^2.1.1",
     "socket.io": "^4.8.3",
-    "stripe": "^22.1.0"
+    "stripe": "^22.1.1"
   }
 }

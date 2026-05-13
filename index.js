@@ -1472,7 +1472,60 @@ io.on("connection", (socket) => {
     endBroadcastForSocket(socket.id);
   });
 });
+/*
+========================================================
+TICKET AUTO-JOIN SAFE PASS (NON-DESTRUCTIVE)
+========================================================
+*/
 
+const TICKETS_FILE = path.join(__dirname, "stro-cheivery-tickets.json");
+
+function loadTickets() {
+  if (!fs.existsSync(TICKETS_FILE)) {
+    fs.writeFileSync(TICKETS_FILE, JSON.stringify([], null, 2), "utf8");
+    return [];
+  }
+
+  try {
+    return JSON.parse(fs.readFileSync(TICKETS_FILE, "utf8"));
+  } catch (err) {
+    return [];
+  }
+}
+
+function findTicket(code) {
+  const tickets = loadTickets();
+  return tickets.find((t) => t.code === code);
+}
+
+app.get("/api/tickets/:code", (req, res) => {
+  const code = String(req.params.code || "").trim();
+
+  if (!code) {
+    return res.status(400).json({
+      ok: false,
+      error: "Missing ticket code",
+    });
+  }
+
+  const ticket = findTicket(code);
+
+  if (!ticket) {
+    return res.status(404).json({
+      ok: false,
+      error: "Invalid ticket",
+    });
+  }
+
+  return res.json({
+    ok: true,
+    ticket: {
+      code: ticket.code,
+      roomId: ticket.roomId || "main-hall",
+      buyerName: ticket.buyerName || "Guest",
+    },
+  });
+});
 server.listen(PORT, () => {
   const usersFileExists = fs.existsSync(USERS_FILE);
 
