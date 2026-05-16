@@ -63,6 +63,10 @@ function normalizeEmail(email) {
   return String(email || "").trim().toLowerCase();
 }
 
+function cleanText(value) {
+  return String(value || "").trim();
+}
+
 function nowIso() {
   return new Date().toISOString();
 }
@@ -77,6 +81,78 @@ function toNumber(value, fallback = 0) {
   return number;
 }
 
+function buildBillingIdentity(input = {}, existing = {}) {
+  const timestamp = nowIso();
+
+  const stripeCustomerId = cleanText(
+    input.stripeCustomerId ||
+      input.stripe_customer_id ||
+      existing.stripeCustomerId ||
+      existing.stripe_customer_id ||
+      ""
+  );
+
+  const stripeSubscriptionId = cleanText(
+    input.stripeSubscriptionId ||
+      input.stripe_subscription_id ||
+      existing.stripeSubscriptionId ||
+      existing.stripe_subscription_id ||
+      ""
+  );
+
+  const stripeCheckoutSessionId = cleanText(
+    input.stripeCheckoutSessionId ||
+      input.stripe_checkout_session_id ||
+      existing.stripeCheckoutSessionId ||
+      existing.stripe_checkout_session_id ||
+      ""
+  );
+
+  const billingStatus = cleanText(
+    input.billingStatus ||
+      input.billing_status ||
+      existing.billingStatus ||
+      existing.billing_status ||
+      ""
+  );
+
+  const lastBillingSyncAt =
+    input.lastBillingSyncAt ||
+    input.last_billing_sync_at ||
+    existing.lastBillingSyncAt ||
+    existing.last_billing_sync_at ||
+    (stripeCustomerId || stripeSubscriptionId || stripeCheckoutSessionId || billingStatus
+      ? timestamp
+      : "");
+
+  return {
+    stripeCustomerId,
+    stripeSubscriptionId,
+    stripeCheckoutSessionId,
+    billingStatus,
+    lastBillingSyncAt,
+  };
+}
+
+function defaultAccount(createdAt, plan = "FREE") {
+  return {
+    accountId: "agv-demo",
+    name: "",
+    email: "",
+    organization: "",
+    role: "owner",
+    plan,
+    createdAt,
+    updatedAt: createdAt,
+    lastLoginAt: "",
+    stripeCustomerId: "",
+    stripeSubscriptionId: "",
+    stripeCheckoutSessionId: "",
+    billingStatus: "",
+    lastBillingSyncAt: "",
+  };
+}
+
 function defaultData() {
   const createdAt = nowIso();
 
@@ -84,25 +160,42 @@ function defaultData() {
     organizationId: "agv-demo",
     plan: "FREE",
     updatedAt: createdAt,
-
-    account: {
-      accountId: "agv-demo",
-      name: "",
-      email: "",
-      organization: "",
-      role: "owner",
-      plan: "FREE",
-      createdAt,
-      updatedAt: createdAt,
-      lastLoginAt: "",
-    },
-
+    account: defaultAccount(createdAt, "FREE"),
     accounts: {},
   };
 }
 
 function writeData(data) {
   fs.writeFileSync(DATA_FILE, JSON.stringify(data, null, 2), "utf8");
+}
+
+function migrateAccount(account = {}, fallback = {}) {
+  const timestamp = nowIso();
+  const plan = normalizePlan(account.plan || fallback.plan || "FREE");
+  const billing = buildBillingIdentity(account, account);
+
+  return {
+    accountId:
+      account.accountId ||
+      account.account_id ||
+      fallback.accountId ||
+      fallback.organizationId ||
+      account.email ||
+      "agv-demo",
+    name: cleanText(account.name || fallback.name || ""),
+    email: normalizeEmail(account.email || fallback.email || ""),
+    organization: cleanText(account.organization || fallback.organization || ""),
+    role: cleanText(account.role || fallback.role || "owner") || "owner",
+    plan,
+    createdAt: account.createdAt || account.created_at || fallback.createdAt || timestamp,
+    updatedAt: account.updatedAt || account.updated_at || fallback.updatedAt || timestamp,
+    lastLoginAt: account.lastLoginAt || account.last_login_at || fallback.lastLoginAt || "",
+    stripeCustomerId: billing.stripeCustomerId,
+    stripeSubscriptionId: billing.stripeSubscriptionId,
+    stripeCheckoutSessionId: billing.stripeCheckoutSessionId,
+    billingStatus: billing.billingStatus,
+    lastBillingSyncAt: billing.lastBillingSyncAt,
+  };
 }
 
 function migrateData(data) {
@@ -119,32 +212,40 @@ function migrateData(data) {
   }
 
   if (!migrated.account || typeof migrated.account !== "object") {
-    migrated.account = {
-      accountId: migrated.organizationId || "agv-demo",
-      name: "",
-      email: "",
-      organization: "",
-      role: "owner",
-      plan: migrated.plan,
-      createdAt: migrated.updatedAt || nowIso(),
-      updatedAt: migrated.updatedAt || nowIso(),
-      lastLoginAt: "",
-    };
+    migrated.account = defaultAccount(migrated.updatedAt || nowIso(), migrated.plan);
   }
 
-  migrated.account.plan = normalizePlan(migrated.account.plan || migrated.plan);
-  migrated.account.accountId = migrated.account.accountId || migrated.organizationId || "agv-demo";
-  migrated.account.name = migrated.account.name || "";
-  migrated.account.email = normalizeEmail(migrated.account.email);
-  migrated.account.organization = migrated.account.organization || "";
-  migrated.account.role = migrated.account.role || "owner";
-  migrated.account.createdAt = migrated.account.createdAt || migrated.updatedAt || nowIso();
-  migrated.account.updatedAt = migrated.account.updatedAt || migrated.updatedAt || nowIso();
-  migrated.account.lastLoginAt = migrated.account.lastLoginAt || "";
+  migrated.account = migrateAccount(migrated.account, {
+    organizationId: migrated.organizationId,
+    plan: migrated.plan,
+    updatedAt: migrated.updatedAt,
+  });
 
   if (!migrated.accounts || typeof migrated.accounts !== "object") {
     migrated.accounts = {};
   }
+
+  Object.keys(migrated.accounts).forEach((emailKey) => {
+    const cleanEmail = normalizeEmail(emailKey);
+    const migratedAccount = migrateAccount(migrated.accounts[emailKey], {
+      organizationId: migrated.organizationId,
+      plan: migrated.plan,
+      updatedAt: migrated.updatedAt,
+    });
+
+    if (cleanEmail && cleanEmail !== emailKey) {
+      delete migrated.accounts[emailKey];
+    }
+
+    if (migratedAccount.email) {
+      migrated.accounts[migratedAccount.email] = migratedAccount;
+    } else if (cleanEmail) {
+      migrated.accounts[cleanEmail] = {
+        ...migratedAccount,
+        email: cleanEmail,
+      };
+    }
+  });
 
   if (migrated.account.email) {
     migrated.accounts[migrated.account.email] = {
@@ -168,9 +269,7 @@ function readData() {
 
     const raw = fs.readFileSync(DATA_FILE, "utf8");
     const parsed = JSON.parse(raw);
-    const data = migrateData(parsed);
-
-    return data;
+    return migrateData(parsed);
   } catch {
     const data = defaultData();
     writeData(data);
@@ -351,6 +450,30 @@ function checkFeature(body = {}) {
   });
 }
 
+function publicAccountPayload(account = {}, fallbackPlan = "FREE") {
+  const plan = normalizePlan(account.plan || fallbackPlan);
+
+  return {
+    accountId: account.accountId || account.email || "agv-demo",
+    name: account.name || "",
+    email: account.email || "",
+    organization: account.organization || "",
+    role: account.role || "owner",
+    plan,
+    createdAt: account.createdAt || "",
+    updatedAt: account.updatedAt || "",
+    lastLoginAt: account.lastLoginAt || "",
+    billing: {
+      stripeCustomerId: account.stripeCustomerId || "",
+      stripeSubscriptionId: account.stripeSubscriptionId || "",
+      stripeCheckoutSessionId: account.stripeCheckoutSessionId || "",
+      billingStatus: account.billingStatus || "",
+      lastBillingSyncAt: account.lastBillingSyncAt || "",
+      connected: Boolean(account.stripeCustomerId || account.stripeSubscriptionId),
+    },
+  };
+}
+
 function getSubscriptionPayload() {
   const data = readData();
   const plan = normalizePlan(data.plan);
@@ -362,6 +485,15 @@ function getSubscriptionPayload() {
     plan,
     limits: PLAN_LIMITS[plan],
     updatedAt: data.updatedAt,
+    billingIdentity: {
+      enabled: true,
+      stripeCustomerId: account.stripeCustomerId || "",
+      stripeSubscriptionId: account.stripeSubscriptionId || "",
+      stripeCheckoutSessionId: account.stripeCheckoutSessionId || "",
+      billingStatus: account.billingStatus || "",
+      lastBillingSyncAt: account.lastBillingSyncAt || "",
+      connected: Boolean(account.stripeCustomerId || account.stripeSubscriptionId),
+    },
     enforcement: {
       enabled: true,
       mode: "advisory",
@@ -372,17 +504,7 @@ function getSubscriptionPayload() {
         "viewer-capacity",
       ],
     },
-    account: {
-      accountId: account.accountId || data.organizationId || "agv-demo",
-      name: account.name || "",
-      email: account.email || "",
-      organization: account.organization || "",
-      role: account.role || "owner",
-      plan: normalizePlan(account.plan || plan),
-      createdAt: account.createdAt || "",
-      updatedAt: account.updatedAt || "",
-      lastLoginAt: account.lastLoginAt || "",
-    },
+    account: publicAccountPayload(account, plan),
   };
 }
 
@@ -404,16 +526,23 @@ function upsertAccount(input = {}) {
     data.organizationId ||
     "agv-demo";
 
+  const billing = buildBillingIdentity(input, existingAccount);
+
   const nextAccount = {
     accountId,
-    name: String(input.name || existingAccount.name || "").trim(),
+    name: cleanText(input.name || existingAccount.name || ""),
     email: cleanEmail,
-    organization: String(input.organization || existingAccount.organization || "").trim(),
-    role: String(input.role || existingAccount.role || "owner").trim() || "owner",
+    organization: cleanText(input.organization || existingAccount.organization || ""),
+    role: cleanText(input.role || existingAccount.role || "owner") || "owner",
     plan: cleanPlan,
     createdAt: existingAccount.createdAt || timestamp,
     updatedAt: timestamp,
     lastLoginAt: input.markLogin ? timestamp : existingAccount.lastLoginAt || "",
+    stripeCustomerId: billing.stripeCustomerId,
+    stripeSubscriptionId: billing.stripeSubscriptionId,
+    stripeCheckoutSessionId: billing.stripeCheckoutSessionId,
+    billingStatus: billing.billingStatus,
+    lastBillingSyncAt: billing.lastBillingSyncAt,
   };
 
   data.organizationId = nextAccount.accountId || data.organizationId || "agv-demo";
@@ -438,6 +567,43 @@ function upsertAccount(input = {}) {
   };
 }
 
+function syncStripeCustomer(input = {}) {
+  const email = normalizeEmail(input.email || input.customerEmail || input.accountEmail || "");
+
+  if (!email) {
+    return {
+      ok: false,
+      status: 400,
+      error: "Email is required to sync Stripe customer data.",
+    };
+  }
+
+  const plan = normalizePlan(input.plan || "FREE");
+  const timestamp = nowIso();
+
+  const result = upsertAccount({
+    name: input.name,
+    email,
+    organization: input.organization,
+    role: input.role || "owner",
+    plan,
+    markLogin: Boolean(input.markLogin),
+    stripeCustomerId: input.stripeCustomerId || input.stripe_customer_id,
+    stripeSubscriptionId: input.stripeSubscriptionId || input.stripe_subscription_id,
+    stripeCheckoutSessionId:
+      input.stripeCheckoutSessionId || input.stripe_checkout_session_id,
+    billingStatus: input.billingStatus || input.billing_status || "active",
+    lastBillingSyncAt: input.lastBillingSyncAt || timestamp,
+  });
+
+  return {
+    ok: true,
+    status: 200,
+    account: result.account,
+    subscription: result.subscription,
+  };
+}
+
 app.get("/health", (req, res) => {
   res.json({
     ok: true,
@@ -445,6 +611,7 @@ app.get("/health", (req, res) => {
     port: PORT,
     dataFile: DATA_FILE,
     enforcement: true,
+    billingIdentity: true,
   });
 });
 
@@ -519,6 +686,23 @@ app.post("/api/subscription/check-feature", (req, res) => {
   res.json(checkFeature(req.body || {}));
 });
 
+app.post("/api/subscription/sync-stripe-customer", (req, res) => {
+  const result = syncStripeCustomer(req.body || {});
+
+  if (!result.ok) {
+    return res.status(result.status || 400).json({
+      ok: false,
+      error: result.error || "Stripe customer sync failed.",
+    });
+  }
+
+  res.json({
+    ok: true,
+    account: result.account,
+    subscription: result.subscription,
+  });
+});
+
 app.get("/api/account", (req, res) => {
   const email = normalizeEmail(req.query.email);
   const account = getAccountByEmail(email);
@@ -532,7 +716,7 @@ app.get("/api/account", (req, res) => {
 
   res.json({
     ok: true,
-    account,
+    account: publicAccountPayload(account, account.plan),
   });
 });
 
@@ -553,6 +737,14 @@ app.post("/api/account/upsert", (req, res) => {
     role: req.body.role || "owner",
     plan: req.body.plan || "FREE",
     markLogin: Boolean(req.body.markLogin),
+    stripeCustomerId: req.body.stripeCustomerId || req.body.stripe_customer_id,
+    stripeSubscriptionId:
+      req.body.stripeSubscriptionId || req.body.stripe_subscription_id,
+    stripeCheckoutSessionId:
+      req.body.stripeCheckoutSessionId || req.body.stripe_checkout_session_id,
+    billingStatus: req.body.billingStatus || req.body.billing_status,
+    lastBillingSyncAt:
+      req.body.lastBillingSyncAt || req.body.last_billing_sync_at,
   });
 
   res.json(result);
@@ -563,4 +755,5 @@ app.listen(PORT, () => {
   console.log("SUBSCRIPTION DATA FILE:", DATA_FILE);
   console.log("ACCOUNT FOUNDATION: ENABLED");
   console.log("PLAN ENFORCEMENT FOUNDATION: ENABLED");
+  console.log("STRIPE CUSTOMER FIELD FOUNDATION: ENABLED");
 });
