@@ -21,3 +21,4 @@ create-stripe-internal-test-price.js
 # AGV environment backups - do not commit secrets
 .env-*
 .env.*
+agv-tickets.json
