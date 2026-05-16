@@ -60,6 +60,24 @@ function cleanEmail(value) {
   return String(value || "").trim().toLowerCase();
 }
 
+function normalizePlan(plan) {
+  const cleanPlan = String(plan || "FREE").trim().toUpperCase();
+
+  if (cleanPlan === "INTERNAL_TEST") {
+    return "CREATOR";
+  }
+
+  if (PLANS[cleanPlan]?.activatesPlan) {
+    return PLANS[cleanPlan].activatesPlan;
+  }
+
+  if (["FREE", "CREATOR", "MINISTRY", "CONVENTION"].includes(cleanPlan)) {
+    return cleanPlan;
+  }
+
+  return "FREE";
+}
+
 async function findCustomerByEmail(email) {
   const customerEmail = cleanEmail(email);
 
@@ -73,6 +91,71 @@ async function findCustomerByEmail(email) {
   });
 
   return customers.data?.[0] || null;
+}
+
+async function syncStripeCustomerToAgv({
+  email,
+  name,
+  organization,
+  plan,
+  stripeCustomerId,
+  stripeSubscriptionId,
+  stripeCheckoutSessionId,
+  billingStatus,
+}) {
+  const cleanCustomerEmail = cleanEmail(email);
+
+  if (!cleanCustomerEmail) {
+    console.log("AGV STRIPE SYNC SKIPPED: missing customer email.");
+    return {
+      ok: false,
+      skipped: true,
+      error: "Missing customer email.",
+    };
+  }
+
+  const body = {
+    email: cleanCustomerEmail,
+    name: cleanText(name),
+    organization: cleanText(organization),
+    plan: normalizePlan(plan),
+    stripeCustomerId: cleanText(stripeCustomerId),
+    stripeSubscriptionId: cleanText(stripeSubscriptionId),
+    stripeCheckoutSessionId: cleanText(stripeCheckoutSessionId),
+    billingStatus: cleanText(billingStatus || "active"),
+  };
+
+  const response = await fetch(
+    `${SUBSCRIPTION_API_BASE}/api/subscription/sync-stripe-customer`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    }
+  );
+
+  const data = await response.json();
+
+  if (!response.ok || !data?.ok) {
+    console.error("AGV STRIPE CUSTOMER SYNC FAILED:", data);
+    return {
+      ok: false,
+      error: data?.error || "AGV subscription sync failed.",
+      data,
+    };
+  }
+
+  console.log("AGV STRIPE CUSTOMER SYNCED:", {
+    email: body.email,
+    plan: body.plan,
+    stripeCustomerId: body.stripeCustomerId || "MISSING",
+    stripeSubscriptionId: body.stripeSubscriptionId || "MISSING",
+  });
+
+  return {
+    ok: true,
+    data,
+  };
 }
 
 app.post(
@@ -129,9 +212,83 @@ app.post(
             console.log("AGV PLAN ACTIVATED:", planToActivate);
             console.log("STRIPE CHECKOUT PLAN:", checkoutPlan);
           }
+
+          const customerEmail =
+            cleanEmail(session?.customer_details?.email) ||
+            cleanEmail(session?.customer_email) ||
+            cleanEmail(session?.metadata?.customerEmail) ||
+            cleanEmail(session?.metadata?.agvCustomerEmail);
+
+          const customerName =
+            cleanText(session?.customer_details?.name) ||
+            cleanText(session?.metadata?.customerName) ||
+            cleanText(session?.metadata?.agvCustomerName);
+
+          const organization =
+            cleanText(session?.metadata?.organization) ||
+            cleanText(session?.metadata?.agvOrganization);
+
+          await syncStripeCustomerToAgv({
+            email: customerEmail,
+            name: customerName,
+            organization,
+            plan: planToActivate,
+            stripeCustomerId: session?.customer || "",
+            stripeSubscriptionId: session?.subscription || "",
+            stripeCheckoutSessionId: session?.id || "",
+            billingStatus: "active",
+          });
         } else {
           console.log("Stripe checkout completed, but AGV plan was missing or invalid.");
         }
+      }
+
+      if (event.type === "customer.subscription.updated") {
+        const subscription = event.data.object;
+
+        const customerId = cleanText(subscription?.customer);
+        const customer =
+          customerId && stripe
+            ? await stripe.customers.retrieve(customerId)
+            : null;
+
+        const customerEmail = cleanEmail(customer?.email);
+        const customerName = cleanText(customer?.name);
+
+        await syncStripeCustomerToAgv({
+          email: customerEmail,
+          name: customerName,
+          organization: "",
+          plan: "",
+          stripeCustomerId: customerId,
+          stripeSubscriptionId: subscription?.id || "",
+          stripeCheckoutSessionId: "",
+          billingStatus: subscription?.status || "active",
+        });
+      }
+
+      if (event.type === "customer.subscription.deleted") {
+        const subscription = event.data.object;
+
+        const customerId = cleanText(subscription?.customer);
+        const customer =
+          customerId && stripe
+            ? await stripe.customers.retrieve(customerId)
+            : null;
+
+        const customerEmail = cleanEmail(customer?.email);
+        const customerName = cleanText(customer?.name);
+
+        await syncStripeCustomerToAgv({
+          email: customerEmail,
+          name: customerName,
+          organization: "",
+          plan: "FREE",
+          stripeCustomerId: customerId,
+          stripeSubscriptionId: subscription?.id || "",
+          stripeCheckoutSessionId: "",
+          billingStatus: "canceled",
+        });
       }
 
       return res.json({ received: true });
@@ -152,6 +309,7 @@ app.get("/health", (req, res) => {
     stripeConfigured: Boolean(stripe),
     webhookConfigured: Boolean(STRIPE_WEBHOOK_SECRET),
     billingPortalRoute: true,
+    stripeCustomerSync: true,
     appBaseUrl: APP_BASE_URL,
     subscriptionApiBase: SUBSCRIPTION_API_BASE,
     plans: {
@@ -181,6 +339,8 @@ app.post("/api/billing/create-checkout-session", async (req, res) => {
 
     const plan = String(req.body.plan || "").trim().toUpperCase();
     const customerEmail = cleanEmail(req.body.customerEmail || req.body.email);
+    const customerName = cleanText(req.body.customerName || req.body.name);
+    const organization = cleanText(req.body.organization);
     const selectedPlan = PLANS[plan];
 
     if (!selectedPlan) {
@@ -213,6 +373,9 @@ app.post("/api/billing/create-checkout-session", async (req, res) => {
         agvPlan: plan,
         agvProduct: selectedPlan.name,
         activatesPlan: selectedPlan.activatesPlan || plan,
+        customerEmail,
+        customerName,
+        organization,
       },
     };
 
@@ -296,6 +459,7 @@ app.listen(PORT, () => {
   console.log("STRIPE CONFIGURED:", Boolean(stripe));
   console.log("WEBHOOK CONFIGURED:", Boolean(STRIPE_WEBHOOK_SECRET));
   console.log("BILLING PORTAL ROUTE: ENABLED");
+  console.log("STRIPE CUSTOMER SYNC: ENABLED");
   console.log("APP BASE URL:", APP_BASE_URL);
   console.log("SUBSCRIPTION API:", SUBSCRIPTION_API_BASE);
   console.log("INTERNAL TEST PRICE ID:", STRIPE_INTERNAL_TEST_PRICE_ID ? "SET" : "MISSING");
