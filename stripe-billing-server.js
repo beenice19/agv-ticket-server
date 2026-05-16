@@ -52,6 +52,29 @@ const PLANS = {
   },
 };
 
+function cleanText(value) {
+  return String(value || "").trim();
+}
+
+function cleanEmail(value) {
+  return String(value || "").trim().toLowerCase();
+}
+
+async function findCustomerByEmail(email) {
+  const customerEmail = cleanEmail(email);
+
+  if (!customerEmail || !stripe) {
+    return null;
+  }
+
+  const customers = await stripe.customers.list({
+    email: customerEmail,
+    limit: 1,
+  });
+
+  return customers.data?.[0] || null;
+}
+
 app.post(
   "/api/billing/webhook",
   express.raw({ type: "application/json" }),
@@ -128,6 +151,7 @@ app.get("/health", (req, res) => {
     port: PORT,
     stripeConfigured: Boolean(stripe),
     webhookConfigured: Boolean(STRIPE_WEBHOOK_SECRET),
+    billingPortalRoute: true,
     appBaseUrl: APP_BASE_URL,
     subscriptionApiBase: SUBSCRIPTION_API_BASE,
     plans: {
@@ -156,6 +180,7 @@ app.post("/api/billing/create-checkout-session", async (req, res) => {
     }
 
     const plan = String(req.body.plan || "").trim().toUpperCase();
+    const customerEmail = cleanEmail(req.body.customerEmail || req.body.email);
     const selectedPlan = PLANS[plan];
 
     if (!selectedPlan) {
@@ -173,7 +198,7 @@ app.post("/api/billing/create-checkout-session", async (req, res) => {
       });
     }
 
-    const session = await stripe.checkout.sessions.create({
+    const sessionConfig = {
       mode: "subscription",
       payment_method_types: ["card"],
       line_items: [
@@ -189,13 +214,20 @@ app.post("/api/billing/create-checkout-session", async (req, res) => {
         agvProduct: selectedPlan.name,
         activatesPlan: selectedPlan.activatesPlan || plan,
       },
-    });
+    };
+
+    if (customerEmail) {
+      sessionConfig.customer_email = customerEmail;
+    }
+
+    const session = await stripe.checkout.sessions.create(sessionConfig);
 
     res.json({
       ok: true,
       plan,
       checkoutUrl: session.url,
       sessionId: session.id,
+      customerId: session.customer || "",
     });
   } catch (error) {
     res.status(500).json({
@@ -205,10 +237,65 @@ app.post("/api/billing/create-checkout-session", async (req, res) => {
   }
 });
 
+app.post("/api/billing/create-portal-session", async (req, res) => {
+  try {
+    if (!stripe) {
+      return res.status(400).json({
+        ok: false,
+        error: "Stripe secret key is not configured yet.",
+      });
+    }
+
+    const customerId = cleanText(req.body.customerId);
+    const customerEmail = cleanEmail(req.body.customerEmail || req.body.email);
+
+    let customer = null;
+
+    if (customerId) {
+      customer = await stripe.customers.retrieve(customerId);
+
+      if (customer?.deleted) {
+        return res.status(404).json({
+          ok: false,
+          error: "Stripe customer was deleted.",
+        });
+      }
+    } else if (customerEmail) {
+      customer = await findCustomerByEmail(customerEmail);
+    }
+
+    if (!customer?.id) {
+      return res.status(404).json({
+        ok: false,
+        error:
+          "Stripe customer not found. Complete checkout first, then open the billing portal.",
+      });
+    }
+
+    const portalSession = await stripe.billingPortal.sessions.create({
+      customer: customer.id,
+      return_url: `${APP_BASE_URL}?billing=portal-return`,
+    });
+
+    res.json({
+      ok: true,
+      portalUrl: portalSession.url,
+      customerId: customer.id,
+      returnUrl: `${APP_BASE_URL}?billing=portal-return`,
+    });
+  } catch (error) {
+    res.status(500).json({
+      ok: false,
+      error: error.message || "Stripe billing portal failed.",
+    });
+  }
+});
+
 app.listen(PORT, () => {
   console.log("AGV STRIPE BILLING SERVER RUNNING ON", PORT);
   console.log("STRIPE CONFIGURED:", Boolean(stripe));
   console.log("WEBHOOK CONFIGURED:", Boolean(STRIPE_WEBHOOK_SECRET));
+  console.log("BILLING PORTAL ROUTE: ENABLED");
   console.log("APP BASE URL:", APP_BASE_URL);
   console.log("SUBSCRIPTION API:", SUBSCRIPTION_API_BASE);
   console.log("INTERNAL TEST PRICE ID:", STRIPE_INTERNAL_TEST_PRICE_ID ? "SET" : "MISSING");
