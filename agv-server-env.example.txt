@@ -1,0 +1,44 @@
+# AGV SERVER ENVIRONMENT TEMPLATE
+# Use this as a checklist for Render / production deployment.
+# Do not put real secrets in Git.
+# Do not paste real secrets into ChatGPT.
+
+# APP SETTINGS
+NODE_ENV=production
+APP_BASE_URL=https://agvision.show
+API_BASE_URL=https://api.agvision.show
+PORT=8787
+
+# DATABASE
+DATABASE_URL=postgresql://USER:PASSWORD@HOST:PORT/DATABASE
+
+# SECURITY
+JWT_SECRET=replace-with-secure-random-secret
+AGV_TICKET_ADMIN_PIN=replace-with-secure-ticket-admin-pin
+AGV_SUPER_ADMIN_PIN=replace-with-secure-super-admin-pin
+
+# LIVEKIT
+LIVEKIT_URL=wss://your-livekit-cloud-url.livekit.cloud
+LIVEKIT_API_KEY=replace-with-livekit-api-key
+LIVEKIT_API_SECRET=replace-with-livekit-api-secret
+LIVEKIT_TOKEN_PORT=8791
+
+# STRIPE
+STRIPE_SECRET_KEY=sk_live_or_test_key_here
+STRIPE_WEBHOOK_SECRET=whsec_replace_this
+
+STRIPE_CREATOR_PRICE_ID=price_replace_creator
+STRIPE_MINISTRY_PRICE_ID=price_replace_ministry
+STRIPE_CONVENTION_PRICE_ID=price_replace_convention
+STRIPE_INTERNAL_TEST_PRICE_ID=price_replace_internal_test
+
+# LOCAL DEVELOPMENT PORT MAP
+# 5175 - Client frontend
+# 8791 - LiveKit token server
+# 8790 - Ticket server
+# 8792 - Subscription / account / plan enforcement
+# 8786 - Event server
+# 8793 - Stripe billing server
+# 8785 - Bulletin server
+# 8788 - Chat server
+# 8789 - Moderator server
