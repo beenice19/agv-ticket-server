@@ -9,7 +9,7 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-const PORT = Number(process.env.LIVEKIT_TOKEN_PORT || 8790);
+const PORT = Number(process.env.PORT || process.env.LIVEKIT_TOKEN_PORT || 8791);
 
 function cleanRoomName(value) {
   return String(value || "main-hall")
