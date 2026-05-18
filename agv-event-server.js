@@ -3,7 +3,7 @@ const cors = require("cors");
 const fs = require("fs");
 const path = require("path");
 
-const PORT = 8786;
+const PORT = Number(process.env.PORT || 8786);
 const DATA_FILE = path.join(__dirname, "agv-events.json");
 
 const app = express();
