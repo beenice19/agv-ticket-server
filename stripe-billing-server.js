@@ -4,7 +4,7 @@ const express = require("express");
 const cors = require("cors");
 const Stripe = require("stripe");
 
-const PORT = 8793;
+const PORT = Number(process.env.PORT || 8793);
 
 const STRIPE_SECRET_KEY = process.env.STRIPE_SECRET_KEY || "";
 const STRIPE_WEBHOOK_SECRET = process.env.STRIPE_WEBHOOK_SECRET || "";
