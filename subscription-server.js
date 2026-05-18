@@ -3,7 +3,7 @@ const cors = require("cors");
 const fs = require("fs");
 const path = require("path");
 
-const PORT = 8792;
+const PORT = Number(process.env.PORT || 8792);
 const DATA_FILE = path.join(__dirname, "agv-subscription.json");
 
 const app = express();
