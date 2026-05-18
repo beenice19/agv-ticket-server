@@ -3,7 +3,7 @@ const cors = require("cors");
 const fs = require("fs");
 const path = require("path");
 
-const PORT = 8785;
+const PORT = Number(process.env.PORT || 8785);
 const DATA_FILE = path.join(__dirname, "agv-bulletins.json");
 
 const app = express();
