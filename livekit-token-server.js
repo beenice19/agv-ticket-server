@@ -11,6 +11,10 @@ app.use(express.json());
 
 const PORT = Number(process.env.PORT || process.env.LIVEKIT_TOKEN_PORT || 8791);
 
+function cleanEnv(name) {
+  return String(process.env[name] || "").trim();
+}
+
 function cleanRoomName(value) {
   return String(value || "main-hall")
     .trim()
@@ -31,9 +35,9 @@ app.get("/health", (req, res) => {
     ok: true,
     service: "AGV LiveKit Token Server",
     livekitConfigured: Boolean(
-      process.env.LIVEKIT_URL &&
-      process.env.LIVEKIT_API_KEY &&
-      process.env.LIVEKIT_API_SECRET
+      cleanEnv("LIVEKIT_URL") &&
+      cleanEnv("LIVEKIT_API_KEY") &&
+      cleanEnv("LIVEKIT_API_SECRET")
     ),
   });
 });
@@ -48,9 +52,9 @@ app.post("/api/livekit/token", async (req, res) => {
     } = req.body || {};
 
     if (
-      !process.env.LIVEKIT_URL ||
-      !process.env.LIVEKIT_API_KEY ||
-      !process.env.LIVEKIT_API_SECRET
+      !cleanEnv("LIVEKIT_URL") ||
+      !cleanEnv("LIVEKIT_API_KEY") ||
+      !cleanEnv("LIVEKIT_API_SECRET")
     ) {
       return res.status(500).json({
         ok: false,
@@ -64,8 +68,8 @@ app.post("/api/livekit/token", async (req, res) => {
     const isHost = role === "admin" || role === "host" || role === "moderator";
 
     const token = new AccessToken(
-      process.env.LIVEKIT_API_KEY,
-      process.env.LIVEKIT_API_SECRET,
+      cleanEnv("LIVEKIT_API_KEY"),
+      cleanEnv("LIVEKIT_API_SECRET"),
       {
         identity: safeIdentity,
         name: String(name || safeIdentity),
@@ -88,7 +92,7 @@ app.post("/api/livekit/token", async (req, res) => {
 
     return res.status(201).json({
       ok: true,
-      server_url: process.env.LIVEKIT_URL,
+      server_url: cleanEnv("LIVEKIT_URL"),
       participant_token: participantToken,
       roomName: safeRoomName,
       role,
@@ -105,5 +109,5 @@ app.post("/api/livekit/token", async (req, res) => {
 
 app.listen(PORT, () => {
   console.log(`AGV LIVEKIT TOKEN SERVER RUNNING ON ${PORT}`);
-  console.log("LIVEKIT URL:", process.env.LIVEKIT_URL || "MISSING");
+  console.log("LIVEKIT URL:", cleanEnv("LIVEKIT_URL") || "MISSING");
 });
