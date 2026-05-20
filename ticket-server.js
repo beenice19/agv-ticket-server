@@ -2,103 +2,93 @@ const express = require("express");
 const cors = require("cors");
 const fs = require("fs");
 const path = require("path");
-
-const PORT = process.env.PORT || 8790;
-const DATA_FILE = path.join(__dirname, "agv-tickets.json");
-
-const ADMIN_PIN = String(process.env.AGV_TICKET_ADMIN_PIN || "AGV-TICKET-2026").trim();
+const crypto = require("crypto");
 
 const app = express();
 
-app.use(cors({ origin: true, credentials: true }));
+const PORT = Number(process.env.PORT || process.env.TICKET_SERVER_PORT || 8790);
+
+const DATA_FILE = path.join(__dirname, "agv-tickets.json");
+
+const DEFAULT_ADMIN_PIN = "AGVElizabethT96Render4827";
+
+const ADMIN_PIN = String(
+  process.env.AGV_TICKET_ADMIN_PIN ||
+    process.env.TICKET_ADMIN_PIN ||
+    process.env.ADMIN_PIN ||
+    DEFAULT_ADMIN_PIN
+).trim();
+
+app.use(
+  cors({
+    origin: true,
+    credentials: false,
+    methods: ["GET", "POST", "OPTIONS"],
+    allowedHeaders: ["Content-Type", "x-agv-admin-pin"],
+  })
+);
+
 app.use(express.json({ limit: "1mb" }));
 
-function nowIso() {
-  return new Date().toISOString();
-}
-
-function cleanText(value) {
-  return String(value || "").trim();
-}
-
-function cleanEmail(value) {
-  return String(value || "").trim().toLowerCase();
-}
-
-function createTicketCode() {
-  return `AGV-${Math.random().toString(36).slice(2, 8).toUpperCase()}`;
-}
-
-function defaultData() {
-  return {
-    tickets: [],
-    createdAt: nowIso(),
-    updatedAt: nowIso(),
-  };
-}
-
-function readData() {
+function readTickets() {
   try {
     if (!fs.existsSync(DATA_FILE)) {
-      const data = defaultData();
-      writeData(data);
-      return data;
+      fs.writeFileSync(DATA_FILE, JSON.stringify({ tickets: [] }, null, 2), "utf8");
     }
 
     const raw = fs.readFileSync(DATA_FILE, "utf8");
-    const data = JSON.parse(raw);
+    const parsed = JSON.parse(raw || "{}");
 
-    if (!Array.isArray(data.tickets)) {
-      data.tickets = [];
+    if (!Array.isArray(parsed.tickets)) {
+      return [];
     }
 
-    return data;
+    return parsed.tickets;
   } catch {
-    const data = defaultData();
-    writeData(data);
-    return data;
+    return [];
   }
 }
 
-function writeData(data) {
-  const safeData = data && typeof data === "object" ? data : defaultData();
-
-  if (!Array.isArray(safeData.tickets)) {
-    safeData.tickets = [];
-  }
-
-  safeData.updatedAt = nowIso();
-
-  fs.writeFileSync(DATA_FILE, JSON.stringify(safeData, null, 2), "utf8");
+function writeTickets(tickets) {
+  fs.writeFileSync(DATA_FILE, JSON.stringify({ tickets }, null, 2), "utf8");
 }
 
-function getAdminPin(req) {
-  return cleanText(
+function getProvidedAdminPin(req) {
+  return String(
     req.headers["x-agv-admin-pin"] ||
-      req.headers["x-admin-pin"] ||
+      req.query.adminPin ||
       req.body?.adminPin ||
-      req.query?.adminPin
-  );
+      ""
+  ).trim();
 }
 
-function requireAdmin(req, res, next) {
-  const providedPin = getAdminPin(req);
+function requireTicketAdmin(req, res, next) {
+  const providedPin = getProvidedAdminPin(req);
 
-  if (!providedPin) {
+  if (!providedPin || providedPin !== ADMIN_PIN) {
     return res.status(401).json({
       ok: false,
-      message: "Admin PIN required.",
+      error: "Ticket admin access denied.",
+      message: "Invalid ticket admin PIN.",
+      adminPinConfigured: Boolean(ADMIN_PIN),
     });
   }
 
-  if (providedPin !== ADMIN_PIN) {
-    return res.status(401).json({
-      ok: false,
-      message: "Unauthorized. Invalid admin PIN.",
-    });
-  }
+  return next();
+}
 
-  next();
+function makeTicketCode() {
+  return `AGV-${crypto.randomBytes(3).toString("hex").toUpperCase()}`;
+}
+
+function normalizeRoomId(value) {
+  const clean = String(value || "main-hall")
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "");
+
+  return clean || "main-hall";
 }
 
 app.get("/", (req, res) => {
@@ -106,190 +96,141 @@ app.get("/", (req, res) => {
     ok: true,
     service: "AGV Ticket Server",
     status: "online",
-    port: PORT,
+    adminPinConfigured: Boolean(ADMIN_PIN),
+    adminPinLength: ADMIN_PIN.length,
   });
 });
 
-app.get("/health", (req, res) => {
+app.get("/api/tickets/health", (req, res) => {
   res.json({
     ok: true,
     service: "AGV Ticket Server",
-    port: PORT,
-    ticketAdminConfigured: Boolean(ADMIN_PIN),
-    dataFile: DATA_FILE,
+    status: "online",
+    adminPinConfigured: Boolean(ADMIN_PIN),
+    adminPinLength: ADMIN_PIN.length,
+    ticketCount: readTickets().length,
   });
 });
 
-
 app.get("/api/tickets/debug-admin-pin", (req, res) => {
-  const providedPin = String(
-    req.headers["x-agv-admin-pin"] ||
-      req.query.adminPin ||
-      ""
-  ).trim();
-
-  const expectedPin = String(
-    process.env.AGV_TICKET_ADMIN_PIN || "AGV-TICKET-2026"
-  ).trim();
+  const providedPin = getProvidedAdminPin(req);
 
   res.json({
     ok: true,
     debug: true,
-    adminPinConfigured: Boolean(process.env.AGV_TICKET_ADMIN_PIN),
-    expectedLength: expectedPin.length,
+    adminPinConfigured: Boolean(ADMIN_PIN),
+    expectedLength: ADMIN_PIN.length,
     providedLength: providedPin.length,
-    matches: providedPin === expectedPin,
-    expectedFirstTwo: expectedPin ? expectedPin.slice(0, 2) : "",
-    expectedLastTwo: expectedPin ? expectedPin.slice(-2) : "",
+    matches: providedPin === ADMIN_PIN,
+    expectedFirstTwo: ADMIN_PIN ? ADMIN_PIN.slice(0, 2) : "",
+    expectedLastTwo: ADMIN_PIN ? ADMIN_PIN.slice(-2) : "",
     providedFirstTwo: providedPin ? providedPin.slice(0, 2) : "",
     providedLastTwo: providedPin ? providedPin.slice(-2) : "",
-    note: "This route does not reveal the full admin PIN."
+    note: "This route does not reveal the full admin PIN.",
   });
 });
 
-app.get("/api/tickets/list", requireAdmin, (req, res) => {
-  const data = readData();
-
+app.get("/api/tickets/list", requireTicketAdmin, (req, res) => {
   res.json({
     ok: true,
-    tickets: data.tickets,
-    count: data.tickets.length,
+    tickets: readTickets(),
   });
 });
 
-app.post("/api/tickets/create", requireAdmin, (req, res) => {
-  const buyerName = cleanText(req.body.buyerName || req.body.name);
-  const buyerEmail = cleanEmail(req.body.buyerEmail || req.body.email);
-  const eventName = cleanText(req.body.eventName || req.body.event || "AGV Live Event");
-  const roomId = cleanText(req.body.roomId || req.body.room || "main-hall");
+app.post("/api/tickets/create", requireTicketAdmin, (req, res) => {
+  const tickets = readTickets();
 
-  if (!buyerName) {
+  const buyerName = String(req.body?.buyerName || req.body?.name || "Guest").trim();
+  const buyerEmail = String(req.body?.buyerEmail || req.body?.email || "").trim().toLowerCase();
+  const eventName = String(req.body?.eventName || req.body?.event || "AGV Live Event").trim();
+  const roomId = normalizeRoomId(req.body?.roomId || req.body?.room || "main-hall");
+
+  if (!buyerName || !buyerEmail) {
     return res.status(400).json({
       ok: false,
-      message: "Buyer name is required.",
+      error: "Buyer name and buyer email are required.",
     });
-  }
-
-  if (!buyerEmail) {
-    return res.status(400).json({
-      ok: false,
-      message: "Buyer email is required.",
-    });
-  }
-
-  const data = readData();
-
-  let code = createTicketCode();
-
-  while (data.tickets.some((ticket) => ticket.code === code)) {
-    code = createTicketCode();
   }
 
   const ticket = {
-    id: `ticket-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
-    code,
+    code: makeTicketCode(),
     buyerName,
     buyerEmail,
     eventName,
     roomId,
     used: false,
-    redeemed: false,
     checkedIn: false,
-    createdAt: nowIso(),
-    updatedAt: nowIso(),
+    createdAt: new Date().toISOString(),
   };
 
-  data.tickets.unshift(ticket);
-  writeData(data);
+  tickets.unshift(ticket);
+  writeTickets(tickets);
 
-  res.json({
+  res.status(201).json({
     ok: true,
     ticket,
-    tickets: data.tickets,
+    tickets,
   });
 });
 
 app.post("/api/tickets/verify", (req, res) => {
-  const code = cleanText(req.body.code).toUpperCase();
+  const code = String(req.body?.code || req.body?.ticketCode || "").trim().toUpperCase();
 
   if (!code) {
     return res.status(400).json({
       ok: false,
-      message: "Ticket code is required.",
+      error: "Ticket code is required.",
+      message: "Enter your ticket code.",
     });
   }
 
-  const data = readData();
-  const ticket = data.tickets.find((item) => String(item.code || "").toUpperCase() === code);
+  const tickets = readTickets();
+  const ticket = tickets.find((item) => String(item.code || "").trim().toUpperCase() === code);
 
   if (!ticket) {
     return res.status(404).json({
       ok: false,
-      message: "Ticket not found.",
-    });
-  }
-
-  if (ticket.used || ticket.redeemed || ticket.checkedIn) {
-    return res.status(409).json({
-      ok: false,
-      message: "Ticket has already been used.",
-      ticket,
+      error: "Ticket not found.",
+      message: "Ticket failed.",
     });
   }
 
   ticket.used = true;
-  ticket.redeemed = true;
   ticket.checkedIn = true;
-  ticket.usedAt = nowIso();
-  ticket.updatedAt = nowIso();
+  ticket.lastVerifiedAt = new Date().toISOString();
 
-  writeData(data);
+  writeTickets(tickets);
 
   res.json({
     ok: true,
-    message: "Ticket approved.",
+    verified: true,
     ticket,
+    roomId: ticket.roomId || "main-hall",
+    message: "Ticket approved.",
   });
 });
 
-app.post("/api/tickets/reset", requireAdmin, (req, res) => {
-  const code = cleanText(req.body.code).toUpperCase();
-
-  if (!code) {
-    return res.status(400).json({
-      ok: false,
-      message: "Ticket code is required.",
-    });
-  }
-
-  const data = readData();
-  const ticket = data.tickets.find((item) => String(item.code || "").toUpperCase() === code);
-
-  if (!ticket) {
-    return res.status(404).json({
-      ok: false,
-      message: "Ticket not found.",
-    });
-  }
-
-  ticket.used = false;
-  ticket.redeemed = false;
-  ticket.checkedIn = false;
-  ticket.usedAt = "";
-  ticket.updatedAt = nowIso();
-
-  writeData(data);
+app.post("/api/tickets/reset", requireTicketAdmin, (req, res) => {
+  writeTickets([]);
 
   res.json({
     ok: true,
-    message: "Ticket reset.",
-    ticket,
-    tickets: data.tickets,
+    message: "All tickets cleared.",
+    tickets: [],
+  });
+});
+
+app.use((req, res) => {
+  res.status(404).json({
+    ok: false,
+    error: "Route not found.",
+    path: req.path,
   });
 });
 
 app.listen(PORT, () => {
   console.log("AGV TICKET SERVER RUNNING ON", PORT);
-  console.log("TICKET DATA FILE:", DATA_FILE);
-  console.log("TICKET ADMIN PIN: CONFIGURED");
+  console.log("DATA FILE:", DATA_FILE);
+  console.log("ADMIN PIN CONFIGURED:", Boolean(ADMIN_PIN));
+  console.log("ADMIN PIN LENGTH:", ADMIN_PIN.length);
 });
