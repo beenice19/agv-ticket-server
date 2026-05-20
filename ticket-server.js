@@ -120,6 +120,33 @@ app.get("/health", (req, res) => {
   });
 });
 
+
+app.get("/api/tickets/debug-admin-pin", (req, res) => {
+  const providedPin = String(
+    req.headers["x-agv-admin-pin"] ||
+      req.query.adminPin ||
+      ""
+  ).trim();
+
+  const expectedPin = String(
+    process.env.AGV_TICKET_ADMIN_PIN || "AGV-TICKET-2026"
+  ).trim();
+
+  res.json({
+    ok: true,
+    debug: true,
+    adminPinConfigured: Boolean(process.env.AGV_TICKET_ADMIN_PIN),
+    expectedLength: expectedPin.length,
+    providedLength: providedPin.length,
+    matches: providedPin === expectedPin,
+    expectedFirstTwo: expectedPin ? expectedPin.slice(0, 2) : "",
+    expectedLastTwo: expectedPin ? expectedPin.slice(-2) : "",
+    providedFirstTwo: providedPin ? providedPin.slice(0, 2) : "",
+    providedLastTwo: providedPin ? providedPin.slice(-2) : "",
+    note: "This route does not reveal the full admin PIN."
+  });
+});
+
 app.get("/api/tickets/list", requireAdmin, (req, res) => {
   const data = readData();
 
