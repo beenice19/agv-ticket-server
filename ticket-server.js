@@ -6,7 +6,7 @@ const path = require("path");
 const PORT = process.env.PORT || 8790;
 const DATA_FILE = path.join(__dirname, "agv-tickets.json");
 
-const ADMIN_PIN = process.env.AGV_TICKET_ADMIN_PIN || "AGV-TICKET-2026";
+const ADMIN_PIN = String(process.env.AGV_TICKET_ADMIN_PIN || "AGV-TICKET-2026").trim();
 
 const app = express();
 
