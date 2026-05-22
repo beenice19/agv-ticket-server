@@ -49,6 +49,18 @@ function cleanText(value) {
   return String(value || "").trim();
 }
 
+function cleanPlan(value) {
+  const plan = String(value || "FREE").trim().toUpperCase();
+
+  if (plan === "INTERNAL_TEST") return "CREATOR";
+
+  if (["FREE", "CREATOR", "MINISTRY", "CONVENTION"].includes(plan)) {
+    return plan;
+  }
+
+  return "FREE";
+}
+
 app.get("/health", (req, res) => {
   res.json({
     ok: true,
@@ -73,6 +85,18 @@ app.post("/api/moderators/:roomId/add", (req, res) => {
   const roomId = cleanText(req.params.roomId || "main-hall");
   const name = cleanText(req.body.name);
   const email = cleanText(req.body.email);
+
+  const requesterRole = cleanText(req.body.requesterRole || req.body.role || "").toLowerCase();
+  const requestedPlan = cleanPlan(req.body.plan || req.body.currentPlan || req.body.createdByPlan || "FREE");
+  const isPrivilegedRequester = requesterRole === "super-admin" || requesterRole === "admin";
+
+  if (requestedPlan === "FREE" && !isPrivilegedRequester) {
+    return res.status(403).json({
+      ok: false,
+      error: "Paid AGV plan required to add moderators. Upgrade to Creator, Ministry, or Convention.",
+      requiredPlan: "CREATOR_OR_HIGHER",
+    });
+  }
 
   if (!name && !email) {
     return res.status(400).json({
@@ -105,6 +129,18 @@ app.post("/api/moderators/:roomId/add", (req, res) => {
 app.post("/api/moderators/:roomId/remove", (req, res) => {
   const roomId = cleanText(req.params.roomId || "main-hall");
   const moderatorId = cleanText(req.body.moderatorId);
+
+  const requesterRole = cleanText(req.body.requesterRole || req.body.role || "").toLowerCase();
+  const requestedPlan = cleanPlan(req.body.plan || req.body.currentPlan || req.body.createdByPlan || "FREE");
+  const isPrivilegedRequester = requesterRole === "super-admin" || requesterRole === "admin";
+
+  if (requestedPlan === "FREE" && !isPrivilegedRequester) {
+    return res.status(403).json({
+      ok: false,
+      error: "Paid AGV plan required to remove moderators. Upgrade to Creator, Ministry, or Convention.",
+      requiredPlan: "CREATOR_OR_HIGHER",
+    });
+  }
 
   const data = readData();
   const room = ensureRoom(data, roomId);

@@ -208,6 +208,18 @@ app.post("/api/events/create", (req, res) => {
   const ticketPrice = cleanText(req.body.ticketPrice);
   const status = cleanText(req.body.status || "draft");
   const owner = buildOwnerFromRequest(req.body);
+
+  const requesterRole = cleanText(req.body.requesterRole || req.body.role || "").toLowerCase();
+  const requestedPlan = cleanPlan(req.body.plan || req.body.createdByPlan || owner.plan || "FREE");
+  const isPrivilegedRequester = requesterRole === "super-admin" || requesterRole === "admin";
+
+  if (requestedPlan === "FREE" && !isPrivilegedRequester) {
+    return res.status(403).json({
+      ok: false,
+      error: "Paid AGV plan required to create events. Upgrade to Creator, Ministry, or Convention.",
+      requiredPlan: "CREATOR_OR_HIGHER",
+    });
+  }
   const timestamp = nowIso();
 
   if (!title) {
