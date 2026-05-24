@@ -3,19 +3,43 @@ const cors = require("cors");
 const fs = require("fs");
 const path = require("path");
 
+let Pool = null;
+
+try {
+  Pool = require("pg").Pool;
+} catch {
+  Pool = null;
+}
+
 const PORT = Number(process.env.PORT || 8794);
 const DATA_FILE = path.join(__dirname, "agv-revenue-reports.json");
+const DATABASE_URL =
+  process.env.DATABASE_URL || process.env.AGV_REVENUE_DATABASE_URL || "";
 
 const app = express();
 
 app.use(cors());
 app.use(express.json({ limit: "1mb" }));
 
+let pool = null;
+let databaseReady = false;
+let databaseError = "";
+
+if (DATABASE_URL && Pool) {
+  pool = new Pool({
+    connectionString: DATABASE_URL,
+    ssl:
+      process.env.NODE_ENV === "production"
+        ? { rejectUnauthorized: false }
+        : false,
+  });
+}
+
 function nowIso() {
   return new Date().toISOString();
 }
 
-function uid(prefix = "rev") {
+function uid(prefix = "revenue") {
   return `${prefix}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 }
 
@@ -33,48 +57,11 @@ function cleanPlan(value) {
 
   if (plan === "INTERNAL_TEST") return "CREATOR";
 
-  if (["FREE", "CREATOR", "MINISTRY", "CONVENTION"].includes(plan)) {
+  if (["FREE", "CREATOR", "MINISTRY", "CONVENTION", "OWNER_ADMIN"].includes(plan)) {
     return plan;
   }
 
   return "FREE";
-}
-
-function loadReports() {
-  try {
-    if (!fs.existsSync(DATA_FILE)) {
-      fs.writeFileSync(
-        DATA_FILE,
-        JSON.stringify({ updatedAt: nowIso(), reports: [] }, null, 2),
-        "utf8"
-      );
-    }
-
-    const parsed = JSON.parse(fs.readFileSync(DATA_FILE, "utf8"));
-
-    if (!Array.isArray(parsed.reports)) {
-      return [];
-    }
-
-    return parsed.reports;
-  } catch {
-    return [];
-  }
-}
-
-function saveReports(reports) {
-  fs.writeFileSync(
-    DATA_FILE,
-    JSON.stringify(
-      {
-        updatedAt: nowIso(),
-        reports,
-      },
-      null,
-      2
-    ),
-    "utf8"
-  );
 }
 
 function calculateFees(body) {
@@ -98,7 +85,6 @@ function isAdminRequest(req) {
     process.env.AGV_REVENUE_ADMIN_PIN || process.env.AGV_ADMIN_PIN || ""
   );
 
-  // Local development safety: if no pin is configured, allow admin actions.
   if (!configuredPin) return true;
 
   const supplied =
@@ -144,21 +130,254 @@ function normalizeReport(body) {
   };
 }
 
-app.get("/health", (req, res) => {
-  const reports = loadReports();
+async function initDatabase() {
+  if (!pool) {
+    databaseReady = false;
+    databaseError = DATABASE_URL
+      ? "pg package unavailable."
+      : "DATABASE_URL not configured.";
+    return false;
+  }
+
+  try {
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS agv_revenue_reports (
+        id TEXT PRIMARY KEY,
+        report JSONB NOT NULL,
+        status TEXT NOT NULL DEFAULT 'Reported',
+        owner_email TEXT,
+        event_name TEXT,
+        room_id TEXT,
+        agv_fee NUMERIC DEFAULT 0,
+        created_at TIMESTAMPTZ DEFAULT NOW(),
+        updated_at TIMESTAMPTZ DEFAULT NOW()
+      );
+    `);
+
+    databaseReady = true;
+    databaseError = "";
+    return true;
+  } catch (error) {
+    databaseReady = false;
+    databaseError = error.message || "Database initialization failed.";
+    console.error("AGV revenue database init failed:", databaseError);
+    return false;
+  }
+}
+
+function ensureJsonFile() {
+  if (!fs.existsSync(DATA_FILE)) {
+    fs.writeFileSync(
+      DATA_FILE,
+      JSON.stringify({ updatedAt: nowIso(), reports: [] }, null, 2),
+      "utf8"
+    );
+  }
+}
+
+function loadReportsFromFile() {
+  try {
+    ensureJsonFile();
+
+    const parsed = JSON.parse(fs.readFileSync(DATA_FILE, "utf8"));
+
+    if (!Array.isArray(parsed.reports)) {
+      return [];
+    }
+
+    return parsed.reports;
+  } catch {
+    return [];
+  }
+}
+
+function saveReportsToFile(reports) {
+  fs.writeFileSync(
+    DATA_FILE,
+    JSON.stringify(
+      {
+        updatedAt: nowIso(),
+        storage: "json-file-fallback",
+        reports,
+      },
+      null,
+      2
+    ),
+    "utf8"
+  );
+}
+
+async function loadReports() {
+  if (databaseReady && pool) {
+    const result = await pool.query(`
+      SELECT report
+      FROM agv_revenue_reports
+      ORDER BY updated_at DESC, created_at DESC
+    `);
+
+    return result.rows.map((row) => row.report);
+  }
+
+  return loadReportsFromFile();
+}
+
+async function saveNewReport(report) {
+  if (databaseReady && pool) {
+    await pool.query(
+      `
+      INSERT INTO agv_revenue_reports (
+        id,
+        report,
+        status,
+        owner_email,
+        event_name,
+        room_id,
+        agv_fee,
+        created_at,
+        updated_at
+      )
+      VALUES ($1, $2, $3, $4, $5, $6, $7, COALESCE($8::timestamptz, NOW()), NOW())
+      ON CONFLICT (id)
+      DO UPDATE SET
+        report = EXCLUDED.report,
+        status = EXCLUDED.status,
+        owner_email = EXCLUDED.owner_email,
+        event_name = EXCLUDED.event_name,
+        room_id = EXCLUDED.room_id,
+        agv_fee = EXCLUDED.agv_fee,
+        updated_at = NOW()
+      `,
+      [
+        report.id,
+        JSON.stringify(report),
+        report.status,
+        report.ownerEmail,
+        report.eventName,
+        report.roomId,
+        report.agvFee,
+        report.createdAt || null,
+      ]
+    );
+
+    return loadReports();
+  }
+
+  const reports = loadReportsFromFile();
+  const nextReports = [report, ...reports];
+  saveReportsToFile(nextReports);
+  return nextReports;
+}
+
+async function updateReportStatus(reportId, nextStatus, adminNotes) {
+  if (databaseReady && pool) {
+    const existing = await pool.query(
+      `
+      SELECT report
+      FROM agv_revenue_reports
+      WHERE id = $1
+      LIMIT 1
+      `,
+      [reportId]
+    );
+
+    if (!existing.rows.length) {
+      return { found: false, reports: await loadReports() };
+    }
+
+    const report = existing.rows[0].report;
+
+    const updatedReport = {
+      ...report,
+      status: nextStatus,
+      adminNotes,
+      updatedAt: nowIso(),
+    };
+
+    await pool.query(
+      `
+      UPDATE agv_revenue_reports
+      SET
+        report = $2,
+        status = $3,
+        updated_at = NOW()
+      WHERE id = $1
+      `,
+      [reportId, JSON.stringify(updatedReport), nextStatus]
+    );
+
+    return { found: true, report: updatedReport, reports: await loadReports() };
+  }
+
+  const reports = loadReportsFromFile();
+  let found = false;
+  let updated = null;
+
+  const nextReports = reports.map((report) => {
+    if (report.id !== reportId) return report;
+
+    found = true;
+
+    updated = {
+      ...report,
+      status: nextStatus,
+      adminNotes,
+      updatedAt: nowIso(),
+    };
+
+    return updated;
+  });
+
+  if (found) {
+    saveReportsToFile(nextReports);
+  }
+
+  return { found, report: updated, reports: nextReports };
+}
+
+async function clearReports() {
+  if (databaseReady && pool) {
+    await pool.query("DELETE FROM agv_revenue_reports");
+    return [];
+  }
+
+  saveReportsToFile([]);
+  return [];
+}
+
+app.get("/", (req, res) => {
+  res.json({
+    ok: true,
+    service: "AGV Revenue Report Server",
+    message: "AGV revenue server is running. Use /health for status.",
+    routes: [
+      "GET /health",
+      "GET /api/revenue-reports",
+      "POST /api/revenue-reports/create",
+      "POST /api/revenue-reports/:id/status",
+      "POST /api/revenue-reports/clear",
+    ],
+  });
+});
+
+app.get("/health", async (req, res) => {
+  const reports = await loadReports();
 
   res.json({
     ok: true,
     service: "AGV Revenue Report Server",
     port: PORT,
     reports: reports.length,
+    storage: databaseReady ? "database" : "json-file-fallback",
+    databaseConfigured: Boolean(DATABASE_URL),
+    databaseReady,
+    databaseError,
     dataFile: DATA_FILE,
     adminPinConfigured: Boolean(process.env.AGV_REVENUE_ADMIN_PIN || process.env.AGV_ADMIN_PIN),
     timestamp: nowIso(),
   });
 });
 
-app.get("/api/revenue-reports", (req, res) => {
+app.get("/api/revenue-reports", async (req, res) => {
   if (!isAdminRequest(req)) {
     return res.status(401).json({
       ok: false,
@@ -166,17 +385,18 @@ app.get("/api/revenue-reports", (req, res) => {
     });
   }
 
-  const reports = loadReports();
+  const reports = await loadReports();
 
   return res.json({
     ok: true,
     reports,
     count: reports.length,
+    storage: databaseReady ? "database" : "json-file-fallback",
     timestamp: nowIso(),
   });
 });
 
-app.post("/api/revenue-reports/create", (req, res) => {
+app.post("/api/revenue-reports/create", async (req, res) => {
   const report = normalizeReport(req.body || {});
 
   if (!report.eventName || report.eventName === "Untitled AGV Event") {
@@ -200,20 +420,18 @@ app.post("/api/revenue-reports/create", (req, res) => {
     });
   }
 
-  const reports = loadReports();
-  const nextReports = [report, ...reports];
-
-  saveReports(nextReports);
+  const nextReports = await saveNewReport(report);
 
   return res.status(201).json({
     ok: true,
     report,
     reports: nextReports,
+    storage: databaseReady ? "database" : "json-file-fallback",
     message: `Revenue report saved. AGV 2% fee: $${report.agvFee.toFixed(2)}.`,
   });
 });
 
-app.post("/api/revenue-reports/:id/status", (req, res) => {
+app.post("/api/revenue-reports/:id/status", async (req, res) => {
   if (!isAdminRequest(req)) {
     return res.status(401).json({
       ok: false,
@@ -234,39 +452,24 @@ app.post("/api/revenue-reports/:id/status", (req, res) => {
     });
   }
 
-  const reports = loadReports();
-  let found = false;
+  const result = await updateReportStatus(reportId, nextStatus, adminNotes);
 
-  const nextReports = reports.map((report) => {
-    if (report.id !== reportId) return report;
-
-    found = true;
-
-    return {
-      ...report,
-      status: nextStatus,
-      adminNotes,
-      updatedAt: nowIso(),
-    };
-  });
-
-  if (!found) {
+  if (!result.found) {
     return res.status(404).json({
       ok: false,
       error: "Revenue report not found.",
     });
   }
 
-  saveReports(nextReports);
-
   return res.json({
     ok: true,
-    report: nextReports.find((report) => report.id === reportId),
-    reports: nextReports,
+    report: result.report,
+    reports: result.reports,
+    storage: databaseReady ? "database" : "json-file-fallback",
   });
 });
 
-app.post("/api/revenue-reports/clear", (req, res) => {
+app.post("/api/revenue-reports/clear", async (req, res) => {
   if (!isAdminRequest(req)) {
     return res.status(401).json({
       ok: false,
@@ -283,11 +486,12 @@ app.post("/api/revenue-reports/clear", (req, res) => {
     });
   }
 
-  saveReports([]);
+  const reports = await clearReports();
 
   return res.json({
     ok: true,
-    reports: [],
+    reports,
+    storage: databaseReady ? "database" : "json-file-fallback",
     message: "All revenue reports cleared.",
   });
 });
@@ -300,7 +504,22 @@ app.use((req, res) => {
   });
 });
 
-app.listen(PORT, () => {
-  console.log("AGV Revenue Report Server running on", PORT);
-  console.log("DATA FILE:", DATA_FILE);
+async function start() {
+  await initDatabase();
+
+  app.listen(PORT, () => {
+    console.log("AGV Revenue Report Server running on", PORT);
+    console.log("STORAGE:", databaseReady ? "database" : "json-file-fallback");
+    console.log("DATABASE CONFIGURED:", Boolean(DATABASE_URL));
+    console.log("DATA FILE:", DATA_FILE);
+
+    if (databaseError) {
+      console.log("DATABASE STATUS:", databaseError);
+    }
+  });
+}
+
+start().catch((error) => {
+  console.error("AGV Revenue Report Server failed to start:", error);
+  process.exit(1);
 });
