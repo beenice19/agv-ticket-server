@@ -263,9 +263,132 @@ function saveUsers() {
   fs.writeFileSync(USERS_FILE, JSON.stringify(users, null, 2), "utf8");
 }
 
+// PASS32D_B_V2_HOST_OWNED_ROOM_CREATION
+const ROOM_PLAN_LIMITS = {
+  FREE: { label: "Free", hostLabel: "FREE HOST", maxRooms: 1, maxViewers: 25, allowPrivate: false, allowTicketOnly: false },
+  CREATOR: { label: "Creator", hostLabel: "CREATOR HOST", maxRooms: 3, maxViewers: 100, allowPrivate: true, allowTicketOnly: true },
+  MINISTRY: { label: "Ministry / Pro", hostLabel: "MINISTRY HOST", maxRooms: 10, maxViewers: 500, allowPrivate: true, allowTicketOnly: true },
+  CONVENTION: { label: "Convention", hostLabel: "CONVENTION HOST", maxRooms: 50, maxViewers: 2000, allowPrivate: true, allowTicketOnly: true },
+};
+
+function cleanRoomText(value) {
+  return String(value || "").trim();
+}
+
+function normalizeRoomPlan(plan) {
+  const cleanPlan = cleanRoomText(plan).toUpperCase();
+  if (cleanPlan === "INTERNAL_TEST") return "CREATOR";
+  return ROOM_PLAN_LIMITS[cleanPlan] ? cleanPlan : "FREE";
+}
+
+function getRoomOwnerIdFromRequest(req) {
+  const bodyOwner =
+    cleanRoomText(req.body?.ownerId) ||
+    cleanRoomText(req.body?.requesterId) ||
+    cleanRoomText(req.body?.ownerEmail) ||
+    cleanRoomText(req.body?.requesterEmail);
+
+  const authOwner =
+    cleanRoomText(req.authUser?.email) ||
+    cleanRoomText(req.authUser?.username) ||
+    cleanRoomText(req.authUser?.displayName);
+
+  return (bodyOwner || authOwner || "unknown-owner").toLowerCase();
+}
+
+function getRoomOwnerEmailFromRequest(req) {
+  return (
+    cleanRoomText(req.body?.ownerEmail) ||
+    cleanRoomText(req.body?.requesterEmail) ||
+    cleanRoomText(req.authUser?.email) ||
+    cleanRoomText(req.authUser?.username) ||
+    ""
+  ).toLowerCase();
+}
+
+function getRoomOwnerNameFromRequest(req) {
+  return (
+    cleanRoomText(req.body?.ownerName) ||
+    cleanRoomText(req.body?.displayName) ||
+    cleanRoomText(req.authUser?.displayName) ||
+    cleanRoomText(req.authUser?.username) ||
+    "AGV Host"
+  );
+}
+
+function isRoomSuperAdmin(req) {
+  return (
+    req.authUser?.globalRole === "superadmin" ||
+    cleanRoomText(req.body?.requesterRole).toLowerCase() === "super-admin"
+  );
+}
+
+function isPlatformRoom(room) {
+  if (!room) return false;
+  return !(
+    cleanRoomText(room.ownerId) ||
+    cleanRoomText(room.ownerEmail) ||
+    cleanRoomText(room.createdBy)
+  );
+}
+
+function roomBelongsToOwner(room, ownerId, ownerEmail) {
+  if (!room) return false;
+
+  const roomOwnerId = cleanRoomText(room.ownerId || room.createdBy || room.ownerEmail).toLowerCase();
+  const roomOwnerEmail = cleanRoomText(room.ownerEmail || room.createdBy).toLowerCase();
+
+  return (
+    Boolean(ownerId && roomOwnerId && roomOwnerId === ownerId) ||
+    Boolean(ownerEmail && roomOwnerEmail && roomOwnerEmail === ownerEmail)
+  );
+}
+
+function getOwnedRoomCount(ownerId, ownerEmail) {
+  return rooms.filter((room) => {
+    if (isPlatformRoom(room)) return false;
+    return roomBelongsToOwner(room, ownerId, ownerEmail);
+  }).length;
+}
+
+function sanitizeOwnedRoom(room) {
+  const clean = sanitizeRoom(room);
+
+  return {
+    ...clean,
+    ownerId: cleanRoomText(room?.ownerId || room?.createdBy),
+    ownerEmail: cleanRoomText(room?.ownerEmail).toLowerCase(),
+    ownerName: cleanRoomText(room?.ownerName),
+    organization: cleanRoomText(room?.organization || room?.ownerOrganization),
+    createdBy: cleanRoomText(room?.createdBy || room?.ownerId || room?.ownerEmail),
+    createdByPlan: normalizeRoomPlan(room?.createdByPlan || room?.planMode || room?.plan),
+    planMode: normalizeRoomPlan(room?.planMode || room?.createdByPlan || room?.plan),
+    planLabel: cleanRoomText(room?.planLabel),
+    planHostLabel: cleanRoomText(room?.planHostLabel),
+    maxRooms: Number(room?.maxRooms || 0),
+    maxViewers: Number(room?.maxViewers || 0),
+    allowPrivate: Boolean(room?.allowPrivate),
+    allowTicketOnly: Boolean(room?.allowTicketOnly),
+    createdAt: cleanRoomText(room?.createdAt),
+  };
+}
+
+function normalizeOwnedRoom(room) {
+  return sanitizeOwnedRoom(room);
+}
+
+function getVisibleRoomsForUser(req) {
+  if (isRoomSuperAdmin(req)) return rooms;
+
+  const ownerId = getRoomOwnerIdFromRequest(req);
+  const ownerEmail = getRoomOwnerEmailFromRequest(req);
+
+  return rooms.filter((room) => isPlatformRoom(room) || roomBelongsToOwner(room, ownerId, ownerEmail));
+}
+
 function loadData() {
   if (!fs.existsSync(DATA_FILE)) {
-    rooms = DEFAULT_ROOMS.map(sanitizeRoom);
+    rooms = DEFAULT_ROOMS.map(sanitizeOwnedRoom);
     roomState = JSON.parse(JSON.stringify(DEFAULT_ROOM_STATE));
     saveData();
     return;
@@ -275,8 +398,8 @@ function loadData() {
     const parsed = JSON.parse(fs.readFileSync(DATA_FILE, "utf8"));
 
     rooms = Array.isArray(parsed.rooms)
-      ? parsed.rooms.map(sanitizeRoom)
-      : DEFAULT_ROOMS.map(sanitizeRoom);
+      ? parsed.rooms.map(sanitizeOwnedRoom)
+      : DEFAULT_ROOMS.map(sanitizeOwnedRoom);
 
     roomState =
       parsed.roomState && typeof parsed.roomState === "object"
@@ -287,7 +410,7 @@ function loadData() {
       ensureRoomState(room.id);
     }
   } catch (error) {
-    rooms = DEFAULT_ROOMS.map(sanitizeRoom);
+    rooms = DEFAULT_ROOMS.map(sanitizeOwnedRoom);
     roomState = JSON.parse(JSON.stringify(DEFAULT_ROOM_STATE));
     saveData();
   }
@@ -789,14 +912,32 @@ app.post(
 app.get("/api/rooms", requireAuth, (req, res) => {
   return res.json({
     ok: true,
-    rooms: rooms.map(normalizeRoom),
+    rooms: getVisibleRoomsForUser(req).map(normalizeOwnedRoom),
   });
 });
 
 app.post("/api/rooms", requireAuth, (req, res) => {
   const name = cleanName(req.body?.name);
-  const category = cleanName(req.body?.category) || "Custom";
-  const isPrivate = Boolean(req.body?.isPrivate);
+  const requestedCategory = cleanName(req.body?.category) || "Custom";
+
+  const ownerId = getRoomOwnerIdFromRequest(req);
+  const ownerEmail = getRoomOwnerEmailFromRequest(req);
+  const ownerName = getRoomOwnerNameFromRequest(req);
+  const organization = cleanRoomText(req.body?.organization || req.body?.ownerOrganization);
+
+  const plan = normalizeRoomPlan(req.body?.plan || req.body?.currentPlan || req.body?.createdByPlan);
+  const limits = ROOM_PLAN_LIMITS[plan] || ROOM_PLAN_LIMITS.FREE;
+  const superAdmin = isRoomSuperAdmin(req);
+
+  const isPrivate = superAdmin
+    ? Boolean(req.body?.isPrivate)
+    : Boolean(req.body?.isPrivate) && limits.allowPrivate;
+
+  const isLocked = Boolean(req.body?.isLocked);
+
+  const allowTicketOnly = superAdmin
+    ? Boolean(req.body?.allowTicketOnly)
+    : Boolean(req.body?.allowTicketOnly) && limits.allowTicketOnly;
 
   if (!name) {
     return res.status(400).json({
@@ -805,22 +946,49 @@ app.post("/api/rooms", requireAuth, (req, res) => {
     });
   }
 
-  let id = slugify(name) || `room-${Date.now()}`;
+  if (!superAdmin) {
+    const ownedRoomCount = getOwnedRoomCount(ownerId, ownerEmail);
+
+    if (ownedRoomCount >= limits.maxRooms) {
+      return res.status(403).json({
+        ok: false,
+        error: "Room limit reached for " + limits.label + " plan. Limit: " + limits.maxRooms + " room(s).",
+        roomLimit: limits.maxRooms,
+        ownedRoomCount,
+      });
+    }
+  }
+
+  let id = slugify(name) || ("room-" + Date.now());
   let attempt = 1;
 
   while (findRoom(id)) {
     attempt += 1;
-    id = `${slugify(name)}-${attempt}`;
+    id = (slugify(name) || "room") + "-" + attempt;
   }
 
-  const room = sanitizeRoom({
+  const room = sanitizeOwnedRoom({
     id,
     name,
-    category,
+    category: requestedCategory,
     isPrivate,
-    isLocked: false,
-    assignedHost: req.authUser.displayName,
-    moderators: [],
+    isLocked,
+    assignedHost: ownerName,
+    moderators: superAdmin ? ["Admin"] : [],
+    ownerId: superAdmin ? cleanRoomText(req.body?.ownerId || "agv-super-admin") : ownerId,
+    ownerEmail: superAdmin ? cleanRoomText(req.body?.ownerEmail || ownerEmail).toLowerCase() : ownerEmail,
+    ownerName,
+    organization,
+    createdBy: superAdmin ? cleanRoomText(req.body?.createdBy || "agv-super-admin") : ownerId,
+    createdByPlan: plan,
+    planMode: plan,
+    planLabel: limits.label,
+    planHostLabel: limits.hostLabel,
+    maxRooms: limits.maxRooms,
+    maxViewers: limits.maxViewers,
+    allowPrivate: limits.allowPrivate,
+    allowTicketOnly,
+    createdAt: new Date().toISOString(),
   });
 
   rooms.push(room);
@@ -832,7 +1000,10 @@ app.post("/api/rooms", requireAuth, (req, res) => {
 
   return res.json({
     ok: true,
-    room: normalizeRoom(room),
+    room: normalizeOwnedRoom(room),
+    rooms: getVisibleRoomsForUser(req).map(normalizeOwnedRoom),
+    roomLimit: limits.maxRooms,
+    ownedRoomCount: superAdmin ? rooms.length : getOwnedRoomCount(ownerId, ownerEmail),
   });
 });
 
