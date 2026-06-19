@@ -95,6 +95,22 @@ function calculateLiveTokensNeeded({ interactiveParticipants, expectedMinutes, s
   return Math.ceil((hostCost + participantCost) * multiplier);
 }
 
+function getBroadcastCreditPackById(packId) {
+  const safePackId = String(packId || "").trim().toLowerCase();
+  return BROADCAST_CREDIT_PACKS.find((pack) => pack.id === safePackId) || null;
+}
+
+// PASS_BROADCAST_PACK_TOPUP_1A
+// SERVER — This is a local top-up endpoint for development.
+// Production version should require Stripe/payment confirmation before credits are added.
+function addBroadcastPackToWallet(wallet, pack) {
+  const credits = Number(pack?.credits || 0);
+  wallet.broadcastCreditsBalance = Number(wallet.broadcastCreditsBalance || 0) + credits;
+  wallet.purchasedBroadcastCredits = Number(wallet.purchasedBroadcastCredits || 0) + credits;
+  wallet.updatedAt = nowIso();
+  return wallet;
+}
+
 function getRecommendedBroadcastPack(shortage) {
   const needed = Math.max(0, Number(shortage || 0));
 
@@ -456,6 +472,77 @@ const server = http.createServer(async (req, res) => {
       wallet: publicWallet(wallet),
       plans: PLAN_USAGE_ALLOWANCES,
       broadcastCreditPacks: BROADCAST_CREDIT_PACKS,
+    });
+  }
+
+  // PASS_BROADCAST_PACK_TOPUP_1A
+  // SERVER — Add prepaid Broadcast Credit Pack to a wallet.
+  // DEVELOPMENT MODE: does not charge payment yet.
+  // PRODUCTION MODE: connect this to Stripe Checkout/webhook before public launch.
+  if (req.method === "POST" && pathname === "/api/usage/add-broadcast-pack") {
+    const body = await readBody(req);
+    const db = loadDb();
+
+    const userId = normalizeUserId(body.userId);
+    const plan = normalizePlan(body.plan);
+    const packId = String(body.packId || "");
+    const wallet = ensureWallet(db, userId, plan);
+    const pack = getBroadcastCreditPackById(packId);
+
+    if (!pack) {
+      saveDb(db);
+      return sendJson(res, 400, {
+        ok: false,
+        error: "Unknown Broadcast Credit Pack.",
+        packId,
+        availablePacks: BROADCAST_CREDIT_PACKS,
+        wallet: publicWallet(wallet),
+      });
+    }
+
+    if (isFreePlan(plan)) {
+      saveDb(db);
+      return sendJson(res, 402, {
+        ok: false,
+        blocked: true,
+        reason: "FREE_PLAN_UPGRADE_REQUIRED",
+        message:
+          "Free plans cannot add Cloudflare Broadcast Credits. Upgrade to Creator, Ministry / Pro, or Convention first.",
+        pack,
+        wallet: publicWallet(wallet),
+      });
+    }
+
+    addBroadcastPackToWallet(wallet, pack);
+
+    if (!db.broadcastPackTransactions || typeof db.broadcastPackTransactions !== "object") {
+      db.broadcastPackTransactions = {};
+    }
+
+    const transactionId = "bpack-" + Date.now() + "-" + Math.random().toString(16).slice(2);
+
+    db.broadcastPackTransactions[transactionId] = {
+      transactionId,
+      userId,
+      plan,
+      packId: pack.id,
+      packName: pack.name,
+      creditsAdded: pack.credits,
+      priceUsd: pack.priceUsd,
+      mode: "local-dev",
+      status: "credited",
+      createdAt: nowIso(),
+    };
+
+    saveDb(db);
+
+    return sendJson(res, 200, {
+      ok: true,
+      usageWalletModel: true,
+      message: pack.name + " added to AGV Broadcast Credits.",
+      transaction: db.broadcastPackTransactions[transactionId],
+      pack,
+      wallet: publicWallet(wallet),
     });
   }
 
