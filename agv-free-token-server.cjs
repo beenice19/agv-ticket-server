@@ -1,4 +1,6 @@
-﻿const http = require("http");
+﻿try { require("dotenv").config(); } catch {}
+
+const http = require("http");
 const fs = require("fs");
 const path = require("path");
 
@@ -473,6 +475,162 @@ const server = http.createServer(async (req, res) => {
       plans: PLAN_USAGE_ALLOWANCES,
       broadcastCreditPacks: BROADCAST_CREDIT_PACKS,
     });
+  }
+
+  // PASS_STRIPE_BROADCAST_PACK_CHECKOUT_1A
+  // SERVER 8794 — Create Stripe Checkout session for Broadcast Credit Packs.
+  // This route creates payment checkout only. Credits should be added after payment success/webhook.
+  if (req.method === "POST" && pathname === "/api/usage/create-broadcast-pack-checkout") {
+    const body = await readBody(req);
+    const db = loadDb();
+
+    const userId = normalizeUserId(body.userId);
+    const plan = normalizePlan(body.plan);
+    const packId = String(body.packId || "");
+    const wallet = ensureWallet(db, userId, plan);
+    const pack = getBroadcastCreditPackById(packId);
+
+    if (!pack) {
+      saveDb(db);
+      return sendJson(res, 400, {
+        ok: false,
+        error: "Unknown Broadcast Credit Pack.",
+        packId,
+        availablePacks: BROADCAST_CREDIT_PACKS,
+        wallet: publicWallet(wallet),
+      });
+    }
+
+    if (isFreePlan(plan)) {
+      saveDb(db);
+      return sendJson(res, 402, {
+        ok: false,
+        blocked: true,
+        reason: "FREE_PLAN_UPGRADE_REQUIRED",
+        message:
+          "Free plans cannot purchase Cloudflare Broadcast Credits. Upgrade to Creator, Ministry / Pro, or Convention first.",
+        pack,
+        wallet: publicWallet(wallet),
+      });
+    }
+
+    if (!process.env.STRIPE_SECRET_KEY) {
+      saveDb(db);
+      return sendJson(res, 500, {
+        ok: false,
+        error: "STRIPE_SECRET_KEY is not configured on SERVER 8794.",
+        wallet: publicWallet(wallet),
+      });
+    }
+
+    let stripe;
+    try {
+      stripe = require("stripe")(process.env.STRIPE_SECRET_KEY);
+    } catch (error) {
+      saveDb(db);
+      return sendJson(res, 500, {
+        ok: false,
+        error: "Stripe package could not be loaded on SERVER 8794.",
+        detail: error?.message || String(error),
+        wallet: publicWallet(wallet),
+      });
+    }
+
+    const appBaseUrl =
+      process.env.AGV_APP_BASE_URL ||
+      process.env.CLIENT_URL ||
+      "http://127.0.0.1:5175";
+
+    const checkoutId =
+      "bpack-checkout-" + Date.now() + "-" + Math.random().toString(16).slice(2);
+
+    if (!db.broadcastPackCheckoutSessions || typeof db.broadcastPackCheckoutSessions !== "object") {
+      db.broadcastPackCheckoutSessions = {};
+    }
+
+    try {
+      const session = await stripe.checkout.sessions.create({
+        mode: "payment",
+        success_url:
+          appBaseUrl +
+          "?agvBroadcastPack=success&packId=" +
+          encodeURIComponent(pack.id) +
+          "&checkoutId=" +
+          encodeURIComponent(checkoutId),
+        cancel_url:
+          appBaseUrl +
+          "?agvBroadcastPack=cancel&packId=" +
+          encodeURIComponent(pack.id),
+        line_items: [
+          {
+            quantity: 1,
+            price_data: {
+              currency: "usd",
+              unit_amount: Math.round(Number(pack.priceUsd || 0) * 100),
+              product_data: {
+                name: pack.name,
+                description:
+                  pack.credits.toLocaleString() +
+                  " AGV Broadcast Credits for Cloudflare public broadcast delivery.",
+                metadata: {
+                  agvProduct: "broadcast_credit_pack",
+                  packId: pack.id,
+                  credits: String(pack.credits),
+                },
+              },
+            },
+          },
+        ],
+        metadata: {
+          agvProduct: "broadcast_credit_pack",
+          checkoutId,
+          userId,
+          plan,
+          packId: pack.id,
+          packName: pack.name,
+          credits: String(pack.credits),
+          priceUsd: String(pack.priceUsd),
+        },
+      });
+
+      db.broadcastPackCheckoutSessions[checkoutId] = {
+        checkoutId,
+        stripeSessionId: session.id,
+        userId,
+        plan,
+        packId: pack.id,
+        packName: pack.name,
+        credits: pack.credits,
+        priceUsd: pack.priceUsd,
+        status: "checkout_created",
+        mode: "stripe-checkout",
+        checkoutUrl: session.url,
+        createdAt: nowIso(),
+      };
+
+      saveDb(db);
+
+      return sendJson(res, 200, {
+        ok: true,
+        usageWalletModel: true,
+        stripeCheckout: true,
+        message: "Stripe Checkout session created for " + pack.name + ".",
+        checkoutId,
+        stripeSessionId: session.id,
+        checkoutUrl: session.url,
+        pack,
+        wallet: publicWallet(wallet),
+      });
+    } catch (error) {
+      saveDb(db);
+      return sendJson(res, 500, {
+        ok: false,
+        error: "Stripe Checkout session could not be created.",
+        detail: error?.message || String(error),
+        pack,
+        wallet: publicWallet(wallet),
+      });
+    }
   }
 
   // PASS_BROADCAST_PACK_TOPUP_1A
