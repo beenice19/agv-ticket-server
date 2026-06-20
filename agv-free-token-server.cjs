@@ -290,6 +290,7 @@ async function handleRequest(req, res) {
       dataFile: DATA_FILE,
       burnModel: BURN_MODEL,
       stripeConfigured: Boolean(stripe),
+      stripeWebhookConfigured: Boolean(process.env.STRIPE_WEBHOOK_SECRET),
     });
   }
 
@@ -532,6 +533,198 @@ async function handleRequest(req, res) {
         wallet,
       });
     }
+  }
+
+
+  // PASS_SERVER_8794_STRIPE_WEBHOOK_1A
+  // SERVER 8794 — Real Stripe webhook for Broadcast Pack crediting.
+  if (method === "POST" && pathname === "/api/usage/stripe-webhook") {
+    if (!stripe) {
+      return sendJson(res, 500, {
+        ok: false,
+        error: "Stripe is not configured on SERVER 8794.",
+      });
+    }
+
+    const webhookSecret = process.env.STRIPE_WEBHOOK_SECRET;
+    if (!webhookSecret) {
+      return sendJson(res, 500, {
+        ok: false,
+        error: "STRIPE_WEBHOOK_SECRET is not configured on SERVER 8794.",
+      });
+    }
+
+    const signature = req.headers["stripe-signature"];
+
+    if (!signature) {
+      return sendJson(res, 400, {
+        ok: false,
+        error: "Missing Stripe signature header.",
+      });
+    }
+
+    let event;
+    let rawBody;
+
+    try {
+      rawBody = await readBodyText(req);
+      event = stripe.webhooks.constructEvent(rawBody, signature, webhookSecret);
+    } catch (err) {
+      return sendJson(res, 400, {
+        ok: false,
+        error: "Stripe webhook signature verification failed.",
+        detail: err.message,
+      });
+    }
+
+    if (
+      event.type !== "checkout.session.completed" &&
+      event.type !== "checkout.session.async_payment_succeeded"
+    ) {
+      return sendJson(res, 200, {
+        ok: true,
+        ignored: true,
+        eventType: event.type,
+      });
+    }
+
+    const session = event.data && event.data.object ? event.data.object : null;
+
+    if (!session || !session.id) {
+      return sendJson(res, 400, {
+        ok: false,
+        error: "Stripe webhook did not include a checkout session.",
+        eventType: event.type,
+      });
+    }
+
+    const paymentStatus = String(session.payment_status || "").toLowerCase();
+
+    if (paymentStatus !== "paid") {
+      return sendJson(res, 200, {
+        ok: true,
+        paid: false,
+        ignored: true,
+        reason: "STRIPE_PAYMENT_NOT_PAID",
+        stripePaymentStatus: session.payment_status,
+        stripeSessionId: session.id,
+      });
+    }
+
+    const db = loadDb();
+
+    if (!db.broadcastPackCheckoutSessions || typeof db.broadcastPackCheckoutSessions !== "object") {
+      db.broadcastPackCheckoutSessions = {};
+    }
+
+    if (!db.broadcastPackTransactions || typeof db.broadcastPackTransactions !== "object") {
+      db.broadcastPackTransactions = {};
+    }
+
+    const metadata = session.metadata || {};
+    const checkoutIdFromStripe = String(metadata.checkoutId || "").trim();
+    const stripeSessionId = String(session.id || "").trim();
+
+    let storedCheckout = checkoutIdFromStripe
+      ? db.broadcastPackCheckoutSessions[checkoutIdFromStripe]
+      : null;
+
+    if (!storedCheckout) {
+      storedCheckout = Object.values(db.broadcastPackCheckoutSessions).find(
+        (entry) => entry && entry.stripeSessionId === stripeSessionId
+      );
+    }
+
+    if (!storedCheckout && checkoutIdFromStripe) {
+      storedCheckout = {
+        checkoutId: checkoutIdFromStripe,
+        stripeSessionId,
+        userId: normalizeUserId(metadata.userId),
+        plan: normalizePlan(metadata.plan),
+        packId: String(metadata.packId || "").trim().toLowerCase(),
+        credits: Number(metadata.credits || 0),
+        priceUsd: Number(metadata.priceUsd || 0),
+        status: "created_from_webhook",
+        createdAt: nowIso(),
+        updatedAt: nowIso(),
+      };
+
+      db.broadcastPackCheckoutSessions[checkoutIdFromStripe] = storedCheckout;
+    }
+
+    if (!storedCheckout) {
+      return sendJson(res, 404, {
+        ok: false,
+        error: "Broadcast Pack checkout session was not found for paid Stripe webhook.",
+        checkoutId: checkoutIdFromStripe,
+        stripeSessionId,
+      });
+    }
+
+    const existingTransaction = Object.values(db.broadcastPackTransactions).find(
+      (tx) => tx && tx.stripeSessionId === stripeSessionId && tx.status === "credited"
+    );
+
+    if (existingTransaction) {
+      return sendJson(res, 200, {
+        ok: true,
+        alreadyCredited: true,
+        transactionId: existingTransaction.transactionId,
+        checkoutId: storedCheckout.checkoutId,
+        stripeSessionId,
+      });
+    }
+
+    const pack = getBroadcastCreditPackById(storedCheckout.packId);
+
+    if (!pack) {
+      return sendJson(res, 500, {
+        ok: false,
+        error: "Stored checkout pack is no longer valid.",
+        checkout: storedCheckout,
+        stripeSessionId,
+      });
+    }
+
+    const wallet = ensureWallet(db, storedCheckout.userId, storedCheckout.plan);
+    addBroadcastPackToWallet(wallet, pack);
+
+    const transactionId =
+      "stripe-webhook-bpack-" + Date.now() + "-" + Math.random().toString(16).slice(2);
+
+    db.broadcastPackTransactions[transactionId] = {
+      transactionId,
+      status: "credited",
+      source: "stripe-webhook",
+      eventId: event.id,
+      eventType: event.type,
+      checkoutId: storedCheckout.checkoutId,
+      stripeSessionId,
+      stripePaymentStatus: session.payment_status,
+      userId: storedCheckout.userId,
+      plan: storedCheckout.plan,
+      packId: pack.id,
+      credits: pack.credits,
+      priceUsd: pack.priceUsd,
+      createdAt: nowIso(),
+    };
+
+    storedCheckout.status = "credited";
+    storedCheckout.paymentStatus = session.payment_status;
+    storedCheckout.creditedTransactionId = transactionId;
+    storedCheckout.updatedAt = nowIso();
+
+    saveDb(db);
+
+    return sendJson(res, 200, {
+      ok: true,
+      paid: true,
+      credited: true,
+      transactionId,
+      checkoutId: storedCheckout.checkoutId,
+      stripeSessionId,
+      wallet,
+    });
   }
 
   if (method === "POST" && pathname === "/api/usage/confirm-broadcast-pack-checkout") {
