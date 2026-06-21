@@ -208,10 +208,35 @@ function ensureWallet(db, userId, plan) {
   }
 
   const wallet = db.wallets[id];
+
+  const previousMonthlyLiveTokens = Number(wallet.monthlyLiveTokens || 0);
+  const previousMonthlyBroadcastCredits = Number(wallet.monthlyBroadcastCredits || 0);
+
   wallet.plan = normalizedPlan;
+
+  // PASS_SERVER_8794_WALLET_PLAN_DEFAULT_FIX_1A
+  // If an older wallet was created as FREE, then later upgraded to CREATOR / MINISTRY / PRO / CONVENTION,
+  // bring its monthly allowance fields up to the current plan defaults without wiping purchased credits.
   wallet.monthlyLiveTokens = Number(wallet.monthlyLiveTokens ?? defaults.monthlyLiveTokens);
+  if (wallet.monthlyLiveTokens < defaults.monthlyLiveTokens) {
+    wallet.monthlyLiveTokens = defaults.monthlyLiveTokens;
+
+    if (Number(wallet.liveTokensBalance || 0) <= previousMonthlyLiveTokens) {
+      wallet.liveTokensBalance = defaults.monthlyLiveTokens;
+    }
+  }
+
   wallet.liveTokensBalance = Number(wallet.liveTokensBalance ?? defaults.monthlyLiveTokens);
+
   wallet.monthlyBroadcastCredits = Number(wallet.monthlyBroadcastCredits ?? defaults.monthlyBroadcastCredits);
+  if (wallet.monthlyBroadcastCredits < defaults.monthlyBroadcastCredits) {
+    wallet.monthlyBroadcastCredits = defaults.monthlyBroadcastCredits;
+
+    if (Number(wallet.broadcastCreditsBalance || 0) <= previousMonthlyBroadcastCredits) {
+      wallet.broadcastCreditsBalance = defaults.monthlyBroadcastCredits;
+    }
+  }
+
   wallet.broadcastCreditsBalance = Number(wallet.broadcastCreditsBalance ?? defaults.monthlyBroadcastCredits);
   wallet.purchasedBroadcastCredits = Number(wallet.purchasedBroadcastCredits || 0);
   wallet.lifetimeBroadcastCreditsUsed = Number(wallet.lifetimeBroadcastCreditsUsed || 0);
@@ -848,6 +873,91 @@ async function handleRequest(req, res) {
       transactionId,
       checkout: storedCheckout,
       pack,
+      wallet,
+    });
+  }
+
+  // PASS_SERVER_8794_LIVE_TOKEN_DEBIT_ROUTE_1A
+  // SERVER 8794 — Debit live tokens while a live session is running.
+  if (method === "POST" && pathname === "/api/usage/live-debit") {
+    const body = await readJsonBody(req);
+
+    if (body.__parseError) {
+      return sendJson(res, 400, {
+        ok: false,
+        error: "Invalid JSON body.",
+        detail: body.__parseError,
+        raw: body.__rawBody,
+      });
+    }
+
+    const db = loadDb();
+
+    const userId = normalizeUserId(body.userId);
+    const plan = normalizePlan(body.plan);
+    const wallet = ensureWallet(db, userId, plan);
+
+    const seconds = Math.max(1, Number(body.seconds || 60));
+    const minutes = Math.max(1 / 60, seconds / 60);
+    const viewerCount = Math.max(0, Number(body.viewerCount || body.viewers || 0));
+    const screenShare = Boolean(body.screenShare || body.screenShareOn);
+
+    const hostCost = BURN_MODEL.hostTokensPerMinute * minutes;
+    const viewerCost = BURN_MODEL.viewerTokensPerViewerPerMinute * viewerCount * minutes;
+    const multiplier = screenShare ? BURN_MODEL.screenShareMultiplier : 1;
+
+    const tokensToDebit = Math.ceil((hostCost + viewerCost) * multiplier);
+
+    const currentBalance =
+      plan === "FREE"
+        ? Number(wallet.balance ?? wallet.liveTokensBalance ?? 0)
+        : Number(wallet.liveTokensBalance ?? wallet.balance ?? 0);
+
+    if (currentBalance < tokensToDebit) {
+      wallet.status = "exhausted";
+      wallet.updatedAt = nowIso();
+      saveDb(db);
+
+      return sendJson(res, 402, {
+        ok: false,
+        blocked: true,
+        reason: "LIVE_TOKENS_EXHAUSTED",
+        message: "Live tokens exhausted. Upgrade or add credits to continue.",
+        userId,
+        plan,
+        tokensToDebit,
+        availableTokens: currentBalance,
+        wallet,
+      });
+    }
+
+    const nextBalance = Math.max(0, currentBalance - tokensToDebit);
+
+    if (plan === "FREE") {
+      wallet.balance = nextBalance;
+      wallet.liveTokensBalance = nextBalance;
+    } else {
+      wallet.liveTokensBalance = nextBalance;
+    }
+
+    wallet.lifetimeDebited = Number(wallet.lifetimeDebited || 0) + tokensToDebit;
+    wallet.updatedAt = nowIso();
+
+    saveDb(db);
+
+    return sendJson(res, 200, {
+      ok: true,
+      debited: true,
+      userId,
+      plan,
+      roomId: body.roomId || "main-hall",
+      sessionId: body.sessionId || "",
+      seconds,
+      viewerCount,
+      screenShare,
+      tokensDebited: tokensToDebit,
+      remainingTokens: nextBalance,
+      burnModel: BURN_MODEL,
       wallet,
     });
   }
