@@ -981,8 +981,8 @@ const server = http.createServer((req, res) => {
   });
 });
 
-server.listen(PORT, "127.0.0.1", () => {
-  console.log(`AGV Usage Wallet Server running on ${PORT}`);
+server.listen(PORT, HOST, () => {
+  console.log(`AGV Usage Wallet Server running on ${HOST}:${PORT}`);
   console.log(`Data file: ${DATA_FILE}`);
   console.log(`Stripe configured: ${Boolean(stripe)}`);
 });
