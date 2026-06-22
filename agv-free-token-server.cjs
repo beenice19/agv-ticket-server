@@ -880,6 +880,146 @@ async function handleRequest(req, res) {
     });
   }
 
+  // PASS_SAFE_WALLET_RESERVE_1B
+  // SERVER 8794 — AGV Live Session Reservation.
+  // This is NOT heartbeat debit. This reserves one safe block before Go Live starts.
+  if (method === "POST" && pathname === "/api/usage/reserve-live-session") {
+    const body = await readJsonBody(req);
+
+    if (body.__parseError) {
+      return sendJson(res, 400, {
+        ok: false,
+        error: "Invalid JSON body.",
+        detail: body.__parseError,
+        raw: body.__rawBody,
+      });
+    }
+
+    const db = loadDb();
+
+    if (!db.liveSessionReservations || typeof db.liveSessionReservations !== "object") {
+      db.liveSessionReservations = {};
+    }
+
+    const userId = normalizeUserId(body.userId || body.email || body.accountEmail);
+    const plan = normalizePlan(body.plan);
+    const wallet = ensureWallet(db, userId, plan);
+
+    const reservationRates = {
+      FREE: 1000,
+      CREATOR: 3000,
+      MINISTRY: 6000,
+      PRO: 6000,
+      CONVENTION: 12000,
+    };
+
+    const tokensToReserve = Math.max(
+      1,
+      Number(body.tokensToReserve || reservationRates[plan] || 6000)
+    );
+
+    const roomId = String(body.roomId || "main-hall").trim() || "main-hall";
+    const eventId = String(body.eventId || "").trim();
+    const requestedSessionId = String(body.sessionId || "").trim();
+    const sessionId =
+      requestedSessionId ||
+      "agv-live-reserve-" + Date.now() + "-" + Math.random().toString(16).slice(2);
+
+    const existingReservation = db.liveSessionReservations[sessionId];
+
+    if (existingReservation && existingReservation.status === "reserved") {
+      return sendJson(res, 200, {
+        ok: true,
+        approved: true,
+        alreadyReserved: true,
+        reason: "LIVE_SESSION_ALREADY_RESERVED",
+        userId,
+        plan,
+        roomId,
+        eventId,
+        sessionId,
+        tokensReserved: Number(existingReservation.tokensReserved || 0),
+        remainingTokens: Number(wallet.liveTokensBalance ?? wallet.balance ?? 0),
+        wallet,
+        reservation: existingReservation,
+      });
+    }
+
+    const currentBalance =
+      plan === "FREE"
+        ? Number(wallet.balance ?? wallet.liveTokensBalance ?? 0)
+        : Number(wallet.liveTokensBalance ?? wallet.balance ?? 0);
+
+    if (currentBalance < tokensToReserve) {
+      wallet.status = "reservation_blocked";
+      wallet.updatedAt = nowIso();
+      saveDb(db);
+
+      return sendJson(res, 402, {
+        ok: false,
+        approved: false,
+        blocked: true,
+        reason: "LIVE_SESSION_RESERVATION_INSUFFICIENT_TOKENS",
+        message: "Go Live blocked. Not enough Live Tokens to reserve this session.",
+        userId,
+        plan,
+        roomId,
+        eventId,
+        sessionId,
+        tokensToReserve,
+        availableTokens: currentBalance,
+        wallet,
+      });
+    }
+
+    const nextBalance = Math.max(0, currentBalance - tokensToReserve);
+
+    if (plan === "FREE") {
+      wallet.balance = nextBalance;
+      wallet.liveTokensBalance = nextBalance;
+    } else {
+      wallet.liveTokensBalance = nextBalance;
+    }
+
+    wallet.lifetimeReserved = Number(wallet.lifetimeReserved || 0) + tokensToReserve;
+    wallet.lastReservationAt = nowIso();
+    wallet.updatedAt = nowIso();
+
+    const reservation = {
+      reservationId: sessionId,
+      sessionId,
+      userId,
+      plan,
+      roomId,
+      eventId,
+      status: "reserved",
+      tokensReserved: tokensToReserve,
+      balanceBefore: currentBalance,
+      balanceAfter: nextBalance,
+      createdAt: nowIso(),
+    };
+
+    db.liveSessionReservations[sessionId] = reservation;
+
+    saveDb(db);
+
+    return sendJson(res, 200, {
+      ok: true,
+      approved: true,
+      reserved: true,
+      reason: "LIVE_SESSION_RESERVED",
+      message: "Live session reserved. Go Live may start.",
+      userId,
+      plan,
+      roomId,
+      eventId,
+      sessionId,
+      tokensReserved: tokensToReserve,
+      remainingTokens: nextBalance,
+      wallet,
+      reservation,
+    });
+  }
   // PASS_SERVER_8794_LIVE_TOKEN_DEBIT_ROUTE_1A
   // SERVER 8794 — Debit live tokens while a live session is running.
   if (method === "POST" && pathname === "/api/usage/live-debit") {
@@ -989,3 +1129,4 @@ server.listen(PORT, HOST, () => {
   console.log(`Data file: ${DATA_FILE}`);
   console.log(`Stripe configured: ${Boolean(stripe)}`);
 });
+
