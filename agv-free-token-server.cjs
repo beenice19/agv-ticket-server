@@ -6,6 +6,9 @@ const path = require("path");
 const { URL } = require("url");
 
 const PORT = Number(process.env.FREE_TOKEN_PORT || process.env.PORT || 8794);
+// PASS_RENDER_HOST_CONST_FIX_1A
+// Render requires public web services to bind to 0.0.0.0.
+const HOST = process.env.HOST || "0.0.0.0";
 const DATA_FILE = path.join(__dirname, "agv-free-token-wallets.json");
 
 const STARTING_FREE_TOKENS = 150000;
