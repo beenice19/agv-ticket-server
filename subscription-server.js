@@ -190,6 +190,11 @@ function migrateAccount(account = {}, fallback = {}) {
     createdAt: account.createdAt || account.created_at || fallback.createdAt || timestamp,
     updatedAt: account.updatedAt || account.updated_at || fallback.updatedAt || timestamp,
     lastLoginAt: account.lastLoginAt || account.last_login_at || fallback.lastLoginAt || "",
+    passwordHash: account.passwordHash || account.password_hash || fallback.passwordHash || "",
+    passwordChangedAt: account.passwordChangedAt || account.password_changed_at || fallback.passwordChangedAt || "",
+    passwordResetHash: account.passwordResetHash || account.password_reset_hash || "",
+    passwordResetExpiresAt: account.passwordResetExpiresAt || account.password_reset_expires_at || "",
+    passwordResetCreatedAt: account.passwordResetCreatedAt || account.password_reset_created_at || "",
     stripeCustomerId: billing.stripeCustomerId,
     stripeSubscriptionId: billing.stripeSubscriptionId,
     stripeCheckoutSessionId: billing.stripeCheckoutSessionId,
@@ -720,6 +725,218 @@ app.get("/api/account", (req, res) => {
   });
 });
 
+
+// PASS_HOST_PASSWORD_RECOVERY_8792_1A
+// SERVER 8792 - Host account password foundation and recovery.
+// Passwords and reset codes are hashed. Old passwords are never revealed.
+const agvHostPasswordBcrypt = require("bcryptjs");
+const agvHostPasswordCrypto = require("crypto");
+function getAgvHostPasswordAccount(email) {
+  const cleanEmail = normalizeEmail(email);
+  const data = readData();
+  if (!cleanEmail) {
+    return { data, account: null, email: "" };
+  }
+  if (!data.accounts || typeof data.accounts !== "object") {
+    data.accounts = {};
+  }
+  let account = data.accounts[cleanEmail] || null;
+  if (!account && data.account?.email === cleanEmail) {
+    account = data.account;
+  }
+  if (!account) {
+    return { data, account: null, email: cleanEmail };
+  }
+  account = migrateAccount(account, {
+    organizationId: data.organizationId,
+    plan: data.plan,
+    updatedAt: data.updatedAt,
+  });
+  data.accounts[cleanEmail] = account;
+  if (data.account?.email === cleanEmail) {
+    data.account = {
+      ...data.account,
+      ...account,
+    };
+  }
+  return { data, account, email: cleanEmail };
+}
+function saveAgvHostPasswordAccount(data, account) {
+  const cleanEmail = normalizeEmail(account?.email);
+  if (!cleanEmail) {
+    return null;
+  }
+  const timestamp = nowIso();
+  if (!data.accounts || typeof data.accounts !== "object") {
+    data.accounts = {};
+  }
+  account.email = cleanEmail;
+  account.updatedAt = timestamp;
+  data.updatedAt = timestamp;
+  data.accounts[cleanEmail] = account;
+  if (!data.account?.email || data.account.email === cleanEmail) {
+    data.account = {
+      ...data.account,
+      ...account,
+    };
+    data.plan = normalizePlan(account.plan || data.plan);
+  }
+  writeData(data);
+  return account;
+}
+app.post("/api/account/set-password", (req, res) => {
+  const email = normalizeEmail(req.body.email || req.body.ownerEmail || req.body.accountEmail || "");
+  const currentPassword = String(req.body.currentPassword || "");
+  const newPassword = String(req.body.newPassword || "");
+  if (!email || !newPassword) {
+    return res.status(400).json({
+      ok: false,
+      error: "Email and new password are required.",
+    });
+  }
+  if (newPassword.length < 8) {
+    return res.status(400).json({
+      ok: false,
+      error: "New password must be at least 8 characters.",
+    });
+  }
+  let holder = getAgvHostPasswordAccount(email);
+  let account = holder.account;
+  let data = holder.data;
+  if (!account) {
+    upsertAccount({
+      email,
+      name: req.body.name || "",
+      organization: req.body.organization || "",
+      role: req.body.role || "owner",
+      plan: req.body.plan || "FREE",
+      markLogin: false,
+    });
+    holder = getAgvHostPasswordAccount(email);
+    account = holder.account;
+    data = holder.data;
+  }
+  if (!account) {
+    return res.status(404).json({
+      ok: false,
+      error: "Account could not be created or found.",
+    });
+  }
+  if (account.passwordHash) {
+    if (!currentPassword) {
+      return res.status(401).json({
+        ok: false,
+        error: "Current password is required to change this host password.",
+      });
+    }
+    const currentPasswordOk = agvHostPasswordBcrypt.compareSync(currentPassword, account.passwordHash);
+    if (!currentPasswordOk) {
+      return res.status(401).json({
+        ok: false,
+        error: "Current password is incorrect.",
+      });
+    }
+  }
+  account.passwordHash = agvHostPasswordBcrypt.hashSync(newPassword, 10);
+  account.passwordChangedAt = nowIso();
+  delete account.passwordResetHash;
+  delete account.passwordResetExpiresAt;
+  delete account.passwordResetCreatedAt;
+  saveAgvHostPasswordAccount(data, account);
+  return res.json({
+    ok: true,
+    message: "Host password saved.",
+    account: publicAccountPayload(account, account.plan),
+  });
+});
+app.post("/api/account/password-reset/request", (req, res) => {
+  const email = normalizeEmail(req.body.email || req.body.ownerEmail || req.body.accountEmail || "");
+  if (!email) {
+    return res.status(400).json({
+      ok: false,
+      error: "Email is required.",
+    });
+  }
+  const holder = getAgvHostPasswordAccount(email);
+  const account = holder.account;
+  if (!account) {
+    return res.json({
+      ok: true,
+      message: "If the host account exists, a reset code has been created.",
+    });
+  }
+  const resetCode = String(agvHostPasswordCrypto.randomInt(100000, 1000000));
+  const expiresAt = Date.now() + 15 * 60 * 1000;
+  account.passwordResetHash = agvHostPasswordBcrypt.hashSync(resetCode, 10);
+  account.passwordResetExpiresAt = new Date(expiresAt).toISOString();
+  account.passwordResetCreatedAt = nowIso();
+  saveAgvHostPasswordAccount(holder.data, account);
+  console.log("");
+  console.log("AGV HOST PASSWORD RESET CODE - SERVER 8792");
+  console.log("Email:", account.email);
+  console.log("Name:", account.name || "AGV Host");
+  console.log("Reset Code:", resetCode);
+  console.log("Expires:", account.passwordResetExpiresAt);
+  console.log("");
+  return res.json({
+    ok: true,
+    message: "If the host account exists, a reset code has been created. Check the SERVER 8792 console.",
+    resetCodeDelivery: "SERVER_8792_CONSOLE_LOCAL_TEST",
+  });
+});
+app.post("/api/account/password-reset/confirm", (req, res) => {
+  const email = normalizeEmail(req.body.email || req.body.ownerEmail || req.body.accountEmail || "");
+  const resetCode = String(req.body.resetCode || "").trim();
+  const newPassword = String(req.body.newPassword || "");
+  if (!email || !resetCode || !newPassword) {
+    return res.status(400).json({
+      ok: false,
+      error: "Email, reset code, and new password are required.",
+    });
+  }
+  if (newPassword.length < 8) {
+    return res.status(400).json({
+      ok: false,
+      error: "New password must be at least 8 characters.",
+    });
+  }
+  const holder = getAgvHostPasswordAccount(email);
+  const account = holder.account;
+  if (!account || !account.passwordResetHash || !account.passwordResetExpiresAt) {
+    return res.status(400).json({
+      ok: false,
+      error: "Invalid or expired reset code.",
+    });
+  }
+  if (Date.now() > new Date(account.passwordResetExpiresAt).getTime()) {
+    delete account.passwordResetHash;
+    delete account.passwordResetExpiresAt;
+    delete account.passwordResetCreatedAt;
+    saveAgvHostPasswordAccount(holder.data, account);
+    return res.status(400).json({
+      ok: false,
+      error: "Reset code expired.",
+    });
+  }
+  const resetCodeOk = agvHostPasswordBcrypt.compareSync(resetCode, account.passwordResetHash);
+  if (!resetCodeOk) {
+    return res.status(400).json({
+      ok: false,
+      error: "Invalid or expired reset code.",
+    });
+  }
+  account.passwordHash = agvHostPasswordBcrypt.hashSync(newPassword, 10);
+  account.passwordChangedAt = nowIso();
+  delete account.passwordResetHash;
+  delete account.passwordResetExpiresAt;
+  delete account.passwordResetCreatedAt;
+  saveAgvHostPasswordAccount(holder.data, account);
+  return res.json({
+    ok: true,
+    message: "Password reset successful. The host may now use the new password.",
+    account: publicAccountPayload(account, account.plan),
+  });
+});
 app.post("/api/account/upsert", (req, res) => {
   const email = normalizeEmail(req.body.email);
 
