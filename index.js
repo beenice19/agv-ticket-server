@@ -9,7 +9,7 @@ const jwt = require("jsonwebtoken");
 const { Server } = require("socket.io");
 
 const app = express();
-const PORT = 8787;
+const PORT = Number(process.env.PORT || 8787); // PASS_LIVE_SERVICE_DEPLOY_MAP_1_RENDER_PORT
 
 app.use(cors());
 app.use(express.json({ limit: "8mb" }));
