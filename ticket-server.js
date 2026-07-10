@@ -6,12 +6,30 @@ const fs = require("fs");
 const path = require("path");
 const crypto = require("crypto");
 const Stripe = require("stripe");
+const { createClient } = require("@supabase/supabase-js"); // PASS_LIVE_TICKET_PERSISTENCE_1A
 const app = express();
 const PORT = Number(process.env.PORT || process.env.TICKET_SERVER_PORT || 8790);
 const DATA_FILE = path.join(__dirname, "agv-tickets.json");
 const CHECKOUTS_FILE = path.join(__dirname, "agv-ticket-checkouts.json");
 const STRIPE_SECRET_KEY = process.env.STRIPE_SECRET_KEY || "";
 const stripe = STRIPE_SECRET_KEY ? Stripe(STRIPE_SECRET_KEY) : null;
+const SUPABASE_URL = String(process.env.SUPABASE_URL || "").trim(); // PASS_LIVE_TICKET_PERSISTENCE_1A
+const SUPABASE_SERVICE_ROLE_KEY = String(
+  process.env.SUPABASE_SERVICE_ROLE_KEY ||
+    process.env.SUPABASE_SERVICE_KEY ||
+    process.env.SUPABASE_SERVICE_ROLE ||
+    ""
+).trim();
+const supabase =
+  SUPABASE_URL && SUPABASE_SERVICE_ROLE_KEY
+    ? createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, {
+        auth: {
+          persistSession: false,
+          autoRefreshToken: false,
+        },
+      })
+    : null;
+const supabaseTicketPersistenceEnabled = Boolean(supabase);
 const DEFAULT_ADMIN_PIN = "AGVElizabethT96Render4827";
 const ADMIN_PIN = String(
   process.env.AGV_TICKET_ADMIN_PIN ||
@@ -61,6 +79,154 @@ function readCheckouts() {
 }
 function writeCheckouts(checkouts) {
   writeJsonFile(CHECKOUTS_FILE, { checkouts });
+}
+// PASS_LIVE_TICKET_PERSISTENCE_1A - Supabase mirror + Supabase-first reads + JSON fallback.
+function ticketToSupabaseRow(ticket) {
+  return {
+    code: String(ticket?.code || "").trim().toUpperCase(),
+    buyer_email: String(ticket?.buyerEmail || "").trim().toLowerCase(),
+    room_id: String(ticket?.roomId || "main-hall").trim(),
+    event_name: String(ticket?.eventName || "AGV Live Event").trim(),
+    stripe_checkout_session_id: String(ticket?.stripeCheckoutSessionId || "").trim(),
+    checkout_id: String(ticket?.checkoutId || "").trim(),
+    payment_status: String(ticket?.paymentStatus || "").trim(),
+    ticket_status: String(ticket?.ticketStatus || "").trim(),
+    amount_total_cents: Number.isFinite(Number(ticket?.amountTotalCents))
+      ? Math.round(Number(ticket.amountTotalCents))
+      : null,
+    payload: ticket || {},
+    updated_at: new Date().toISOString(),
+  };
+}
+function checkoutToSupabaseRow(checkout) {
+  return {
+    checkout_id: String(checkout?.checkoutId || "").trim(),
+    stripe_checkout_session_id: String(checkout?.stripeCheckoutSessionId || "").trim(),
+    buyer_email: String(checkout?.buyerEmail || "").trim().toLowerCase(),
+    room_id: String(checkout?.roomId || "main-hall").trim(),
+    event_name: String(checkout?.eventName || "AGV Live Event").trim(),
+    status: String(checkout?.status || "").trim(),
+    payment_status: String(checkout?.paymentStatus || "").trim(),
+    amount_cents: Number.isFinite(Number(checkout?.amountCents))
+      ? Math.round(Number(checkout.amountCents))
+      : null,
+    ticket_issued: Boolean(checkout?.ticketIssued),
+    ticket_code: String(checkout?.ticketCode || "").trim().toUpperCase(),
+    payload: checkout || {},
+    updated_at: new Date().toISOString(),
+  };
+}
+async function readTicketsPersisted() {
+  const jsonTickets = readTickets();
+  if (!supabase) {
+    return jsonTickets;
+  }
+  try {
+    const { data, error } = await supabase
+      .from("agv_ticket_records")
+      .select("payload")
+      .order("created_at", { ascending: false });
+    if (error) {
+      console.warn("AGV TICKET SUPABASE READ TICKETS FALLBACK:", error.message);
+      return jsonTickets;
+    }
+    const supabaseTickets = Array.isArray(data)
+      ? data.map((row) => row.payload).filter(Boolean)
+      : [];
+    return supabaseTickets.length ? supabaseTickets : jsonTickets;
+  } catch (error) {
+    console.warn("AGV TICKET SUPABASE READ TICKETS ERROR:", error.message);
+    return jsonTickets;
+  }
+}
+async function readCheckoutsPersisted() {
+  const jsonCheckouts = readCheckouts();
+  if (!supabase) {
+    return jsonCheckouts;
+  }
+  try {
+    const { data, error } = await supabase
+      .from("agv_ticket_checkouts")
+      .select("payload")
+      .order("created_at", { ascending: false });
+    if (error) {
+      console.warn("AGV TICKET SUPABASE READ CHECKOUTS FALLBACK:", error.message);
+      return jsonCheckouts;
+    }
+    const supabaseCheckouts = Array.isArray(data)
+      ? data.map((row) => row.payload).filter(Boolean)
+      : [];
+    return supabaseCheckouts.length ? supabaseCheckouts : jsonCheckouts;
+  } catch (error) {
+    console.warn("AGV TICKET SUPABASE READ CHECKOUTS ERROR:", error.message);
+    return jsonCheckouts;
+  }
+}
+async function writeTicketsPersisted(tickets) {
+  writeTickets(tickets);
+  if (!supabase) {
+    return;
+  }
+  const rows = (Array.isArray(tickets) ? tickets : [])
+    .filter((ticket) => ticket && ticket.code)
+    .map(ticketToSupabaseRow);
+  if (!rows.length) {
+    return;
+  }
+  const { error } = await supabase
+    .from("agv_ticket_records")
+    .upsert(rows, { onConflict: "code" });
+  if (error) {
+    console.warn("AGV TICKET SUPABASE WRITE TICKETS FAILED:", error.message);
+  }
+}
+async function writeCheckoutsPersisted(checkouts) {
+  writeCheckouts(checkouts);
+  if (!supabase) {
+    return;
+  }
+  const rows = (Array.isArray(checkouts) ? checkouts : [])
+    .filter((checkout) => checkout && checkout.checkoutId)
+    .map(checkoutToSupabaseRow);
+  if (!rows.length) {
+    return;
+  }
+  const { error } = await supabase
+    .from("agv_ticket_checkouts")
+    .upsert(rows, { onConflict: "checkout_id" });
+  if (error) {
+    console.warn("AGV TICKET SUPABASE WRITE CHECKOUTS FAILED:", error.message);
+  }
+}
+async function findTicketByCheckoutSessionIdPersisted(sessionId) {
+  const tickets = await readTicketsPersisted();
+  return tickets.find((ticket) => String(ticket.stripeCheckoutSessionId || "") === String(sessionId || ""));
+}
+async function resetTicketsPersisted() {
+  writeTickets([]);
+  if (!supabase) {
+    return;
+  }
+  const { error } = await supabase
+    .from("agv_ticket_records")
+    .delete()
+    .neq("code", "__never_match__");
+  if (error) {
+    console.warn("AGV TICKET SUPABASE RESET TICKETS FAILED:", error.message);
+  }
+}
+async function resetCheckoutsPersisted() {
+  writeCheckouts([]);
+  if (!supabase) {
+    return;
+  }
+  const { error } = await supabase
+    .from("agv_ticket_checkouts")
+    .delete()
+    .neq("checkout_id", "__never_match__");
+  if (error) {
+    console.warn("AGV TICKET SUPABASE RESET CHECKOUTS FAILED:", error.message);
+  }
 }
 function getProvidedAdminPin(req) {
   return String(
@@ -173,18 +339,22 @@ app.get("/", (req, res) => {
     adminPinLength: ADMIN_PIN.length,
   });
 });
-app.get("/api/tickets/health", (req, res) => {
+app.get("/api/tickets/health", async (req, res) => {
+  const tickets = await readTicketsPersisted();
+  const checkouts = await readCheckoutsPersisted();
   res.json({
     ok: true,
     service: "AGV Ticket Server",
     status: "online",
     pass: "AGV_REVENUE_LOCK_1B",
+    persistencePass: "PASS_LIVE_TICKET_PERSISTENCE_1A",
     stripeConfigured: Boolean(stripe),
+    supabasePersistenceConfigured: supabaseTicketPersistenceEnabled,
     appBaseUrl: APP_BASE_URL,
     adminPinConfigured: Boolean(ADMIN_PIN),
     adminPinLength: ADMIN_PIN.length,
-    ticketCount: readTickets().length,
-    checkoutCount: readCheckouts().length,
+    ticketCount: tickets.length,
+    checkoutCount: checkouts.length,
   });
 });
 app.get("/api/tickets/debug-admin-pin", (req, res) => {
@@ -203,14 +373,14 @@ app.get("/api/tickets/debug-admin-pin", (req, res) => {
     note: "This route does not reveal the full admin PIN.",
   });
 });
-app.get("/api/tickets/list", requireTicketAdmin, (req, res) => {
+app.get("/api/tickets/list", requireTicketAdmin, async (req, res) => {
   res.json({
     ok: true,
-    tickets: readTickets(),
+    tickets: await readTicketsPersisted(),
   });
 });
-app.post("/api/tickets/create", requireTicketAdmin, (req, res) => {
-  const tickets = readTickets();
+app.post("/api/tickets/create", requireTicketAdmin, async (req, res) => {
+  const tickets = await readTicketsPersisted();
   const buyerName = cleanText(req.body?.buyerName || req.body?.name || "Guest");
   const buyerEmail = cleanEmail(req.body?.buyerEmail || req.body?.email || "");
   const eventName = cleanText(req.body?.eventName || req.body?.event || "AGV Live Event");
@@ -234,7 +404,7 @@ app.post("/api/tickets/create", requireTicketAdmin, (req, res) => {
     createdAt: new Date().toISOString(),
   };
   tickets.unshift(ticket);
-  writeTickets(tickets);
+  await writeTicketsPersisted(tickets);
   res.status(201).json({
     ok: true,
     ticket,
@@ -308,7 +478,7 @@ app.post("/api/tickets/checkout", async (req, res) => {
         },
       ],
     });
-    const checkouts = readCheckouts();
+    const checkouts = await readCheckoutsPersisted();
     const checkoutRecord = {
       checkoutId,
       stripeCheckoutSessionId: session.id,
@@ -326,7 +496,7 @@ app.post("/api/tickets/checkout", async (req, res) => {
       ticketIssued: false,
     };
     checkouts.unshift(checkoutRecord);
-    writeCheckouts(checkouts);
+    await writeCheckoutsPersisted(checkouts);
     res.status(201).json({
       ok: true,
       checkoutId,
@@ -360,7 +530,7 @@ app.post("/api/tickets/confirm-checkout", async (req, res) => {
         error: "Stripe checkout session ID is required.",
       });
     }
-    const existingTicket = findTicketByCheckoutSessionId(sessionId);
+    const existingTicket = await findTicketByCheckoutSessionIdPersisted(sessionId);
     if (existingTicket) {
       return res.json({
         ok: true,
@@ -380,7 +550,7 @@ app.post("/api/tickets/confirm-checkout", async (req, res) => {
         error: "Payment has not been verified as paid. No ticket was issued.",
       });
     }
-    const checkouts = readCheckouts();
+    const checkouts = await readCheckoutsPersisted();
     const checkoutRecord = checkouts.find((item) => String(item.stripeCheckoutSessionId || "") === sessionId);
     if (!checkoutRecord) {
       return res.status(404).json({
@@ -395,7 +565,7 @@ app.post("/api/tickets/confirm-checkout", async (req, res) => {
       checkoutRecord.paymentStatus = session.payment_status;
       checkoutRecord.stripeAmountTotal = paidAmount;
       checkoutRecord.updatedAt = new Date().toISOString();
-      writeCheckouts(checkouts);
+      await writeCheckoutsPersisted(checkouts);
       return res.status(409).json({
         ok: false,
         error: "Paid amount did not match expected ticket amount. Manual review required. No ticket was issued.",
@@ -436,9 +606,9 @@ app.post("/api/tickets/confirm-checkout", async (req, res) => {
       revenue,
       createdAt: new Date().toISOString(),
     };
-    const tickets = readTickets();
+    const tickets = await readTicketsPersisted();
     tickets.unshift(ticket);
-    writeTickets(tickets);
+    await writeTicketsPersisted(tickets);
     checkoutRecord.status = "PAID_TICKET_ISSUED";
     checkoutRecord.paymentStatus = "paid";
     checkoutRecord.ticketIssued = true;
@@ -446,7 +616,7 @@ app.post("/api/tickets/confirm-checkout", async (req, res) => {
     checkoutRecord.stripeAmountTotal = paidAmount;
     checkoutRecord.revenue = revenue;
     checkoutRecord.updatedAt = new Date().toISOString();
-    writeCheckouts(checkouts);
+    await writeCheckoutsPersisted(checkouts);
     res.status(201).json({
       ok: true,
       verified: true,
@@ -463,7 +633,7 @@ app.post("/api/tickets/confirm-checkout", async (req, res) => {
     });
   }
 });
-app.post("/api/tickets/verify", (req, res) => {
+app.post("/api/tickets/verify", async (req, res) => {
   const code = String(req.body?.code || req.body?.ticketCode || "").trim().toUpperCase();
   if (!code) {
     return res.status(400).json({
@@ -472,7 +642,7 @@ app.post("/api/tickets/verify", (req, res) => {
       message: "Enter your ticket code.",
     });
   }
-  const tickets = readTickets();
+  const tickets = await readTicketsPersisted();
   const ticket = tickets.find((item) => String(item.code || "").trim().toUpperCase() === code);
   if (!ticket) {
     return res.status(404).json({
@@ -492,7 +662,7 @@ app.post("/api/tickets/verify", (req, res) => {
   ticket.used = true;
   ticket.checkedIn = true;
   ticket.lastVerifiedAt = new Date().toISOString();
-  writeTickets(tickets);
+  await writeTicketsPersisted(tickets);
   res.json({
     ok: true,
     verified: true,
@@ -501,12 +671,14 @@ app.post("/api/tickets/verify", (req, res) => {
     message: "Ticket approved.",
   });
 });
-app.post("/api/tickets/reset", requireTicketAdmin, (req, res) => {
-  writeTickets([]);
+app.post("/api/tickets/reset", requireTicketAdmin, async (req, res) => {
+  await resetTicketsPersisted();
+  await resetCheckoutsPersisted();
   res.json({
     ok: true,
-    message: "All tickets cleared.",
+    message: "All tickets and checkouts cleared.",
     tickets: [],
+    checkouts: [],
   });
 });
 app.use((req, res) => {
