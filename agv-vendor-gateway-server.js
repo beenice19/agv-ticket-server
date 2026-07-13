@@ -9,6 +9,7 @@ const path = require("path");
 const express = require("express");
 const cors = require("cors");
 const Stripe = require("stripe");
+const crypto = require("crypto");
 
 const app = express();
 
@@ -20,6 +21,9 @@ const CLIENT_BASE_URL =
 
 const STRIPE_SECRET_KEY = process.env.STRIPE_SECRET_KEY || "";
 const stripe = STRIPE_SECRET_KEY ? Stripe(STRIPE_SECRET_KEY) : null;
+const INTERNAL_SERVICE_TOKEN = String(
+  process.env.AGV_INTERNAL_SERVICE_TOKEN || process.env.AGV_SERVICE_TOKEN || ""
+).trim();
 
 const DATA_FILE = path.join(__dirname, "agv-vendors.json");
 
@@ -36,6 +40,33 @@ function safeText(value) {
 
 function safeEmail(value) {
   return safeText(value).toLowerCase();
+}
+
+// PASS_STRIPE_CONNECT_HOST_PAYMENTS_1A - Protected server-to-server payment routing.
+function secureTokenEqual(left, right) {
+  const leftBuffer = Buffer.from(String(left || ""), "utf8");
+  const rightBuffer = Buffer.from(String(right || ""), "utf8");
+  if (leftBuffer.length !== rightBuffer.length) return false;
+  return crypto.timingSafeEqual(leftBuffer, rightBuffer);
+}
+
+function requireInternalService(req, res, next) {
+  if (!INTERNAL_SERVICE_TOKEN) {
+    return res.status(503).json({
+      ok: false,
+      error: "Internal payment routing is not configured.",
+    });
+  }
+
+  const suppliedToken = safeText(req.get("x-agv-internal-token"));
+  if (!secureTokenEqual(suppliedToken, INTERNAL_SERVICE_TOKEN)) {
+    return res.status(401).json({
+      ok: false,
+      error: "Internal service authentication failed.",
+    });
+  }
+
+  next();
 }
 
 function makeVendorId() {
@@ -227,6 +258,90 @@ app.get("/api/vendor/status", async (req, res) => {
   res.json({
     ok: true,
     vendor: publicVendor(vendor),
+  });
+});
+
+// PASS_STRIPE_CONNECT_HOST_PAYMENTS_1A
+app.get("/api/vendor/internal/payment-routing", requireInternalService, async (req, res) => {
+  const data = readVendors();
+  const vendor = findVendor(data, req.query || {});
+
+  if (!vendor) {
+    return res.status(404).json({
+      ok: false,
+      error: "Host financial profile was not found.",
+    });
+  }
+
+  if (stripe && vendor.gateway === "STRIPE" && vendor.stripeAccountId) {
+    try {
+      const account = await stripe.accounts.retrieve(vendor.stripeAccountId);
+      vendor.chargesEnabled = Boolean(account.charges_enabled);
+      vendor.payoutsEnabled = Boolean(account.payouts_enabled);
+      vendor.detailsSubmitted = Boolean(account.details_submitted);
+      vendor.gatewayStatus =
+        vendor.chargesEnabled && vendor.payoutsEnabled
+          ? "VERIFIED"
+          : vendor.detailsSubmitted
+          ? "PENDING_VERIFICATION"
+          : "ONBOARDING_REQUIRED";
+      vendor.updatedAt = nowIso();
+      writeVendors(data);
+    } catch (error) {
+      console.error("INTERNAL STRIPE ROUTING STATUS FAILED:", error.message);
+      return res.status(502).json({
+        ok: false,
+        error: "Stripe host-account status could not be verified.",
+      });
+    }
+  }
+
+  const approved = vendor.approvalStatus === "APPROVED";
+  const ticketSalesEnabled = Boolean(vendor.ticketSalesEnabled);
+  let eligible = false;
+  let settlementMode = "BLOCKED";
+  let reason = "";
+
+  if (!approved) {
+    reason = "Host financial profile is not approved.";
+  } else if (!ticketSalesEnabled) {
+    reason = "Ticket sales are not enabled for this host.";
+  } else if (
+    vendor.gateway === "STRIPE" &&
+    vendor.gatewayStatus === "VERIFIED" &&
+    vendor.stripeAccountId &&
+    vendor.chargesEnabled &&
+    vendor.payoutsEnabled
+  ) {
+    eligible = true;
+    settlementMode = "STRIPE_CONNECT";
+  } else if (
+    vendor.gateway === "AGV_GATEWAY" &&
+    vendor.gatewayStatus === "AGV_GATEWAY_ACTIVE"
+  ) {
+    eligible = true;
+    settlementMode = "AGV_GATEWAY";
+  } else {
+    reason = "The selected host payment gateway is not ready for ticket settlement.";
+  }
+
+  res.json({
+    ok: true,
+    eligible,
+    settlementMode,
+    reason,
+    vendorId: vendor.vendorId,
+    gateway: vendor.gateway,
+    gatewayStatus: vendor.gatewayStatus,
+    approvalStatus: vendor.approvalStatus,
+    ticketSalesEnabled,
+    stripeAccountId:
+      eligible && settlementMode === "STRIPE_CONNECT"
+        ? vendor.stripeAccountId
+        : "",
+    chargesEnabled: Boolean(vendor.chargesEnabled),
+    payoutsEnabled: Boolean(vendor.payoutsEnabled),
+    detailsSubmitted: Boolean(vendor.detailsSubmitted),
   });
 });
 
