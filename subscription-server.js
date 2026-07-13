@@ -1,3 +1,4 @@
+require("dotenv").config();
 const express = require("express");
 const cors = require("cors");
 const fs = require("fs");
@@ -731,6 +732,10 @@ app.get("/api/account", (req, res) => {
 // Passwords and reset codes are hashed. Old passwords are never revealed.
 const agvHostPasswordBcrypt = require("bcryptjs");
 const agvHostPasswordCrypto = require("crypto");
+const agvHostSessionJwt = require("jsonwebtoken");
+const AGV_SESSION_SECRET = String(process.env.AGV_SESSION_SECRET || "").trim();
+const AGV_SESSION_TTL = "2h";
+const agvHostLoginAttempts = new Map();
 function getAgvHostPasswordAccount(email) {
   const cleanEmail = normalizeEmail(email);
   const data = readData();
@@ -784,6 +789,80 @@ function saveAgvHostPasswordAccount(data, account) {
   writeData(data);
   return account;
 }
+// CONTROL_LIST_1A2_VERIFIED_HOST_LOGIN
+app.post("/api/account/login", (req, res) => {
+  if (!AGV_SESSION_SECRET) {
+    return res.status(503).json({
+      ok: false,
+      error: "Verified AGV account login is not configured.",
+    });
+  }
+  const email = normalizeEmail(req.body.email || req.body.ownerEmail || "");
+  const password = String(req.body.password || "");
+  const attemptKey = email || String(req.ip || "unknown");
+  const now = Date.now();
+  const previousAttempt = agvHostLoginAttempts.get(attemptKey) || {
+    count: 0,
+    windowStartedAt: now,
+  };
+  const activeAttempt =
+    now - previousAttempt.windowStartedAt > 15 * 60 * 1000
+      ? { count: 0, windowStartedAt: now }
+      : previousAttempt;
+  if (activeAttempt.count >= 5) {
+    return res.status(429).json({
+      ok: false,
+      error: "Too many failed login attempts. Try again later.",
+    });
+  }
+  if (!email || !password) {
+    return res.status(400).json({
+      ok: false,
+      error: "Email and password are required.",
+    });
+  }
+  const holder = getAgvHostPasswordAccount(email);
+  const account = holder.account;
+  const passwordOk = Boolean(
+    account?.passwordHash &&
+      agvHostPasswordBcrypt.compareSync(password, account.passwordHash)
+  );
+  if (!passwordOk) {
+    activeAttempt.count += 1;
+    agvHostLoginAttempts.set(attemptKey, activeAttempt);
+    return res.status(401).json({
+      ok: false,
+      error: "Invalid email or password.",
+    });
+  }
+  agvHostLoginAttempts.delete(attemptKey);
+  account.lastLoginAt = nowIso();
+  saveAgvHostPasswordAccount(holder.data, account);
+  const token = agvHostSessionJwt.sign(
+    {
+      sub: account.accountId || account.id || account.email,
+      email: account.email,
+      role: account.role || "owner",
+      plan: normalizePlan(account.plan || "FREE"),
+      tokenType: "agv_host_session",
+    },
+    AGV_SESSION_SECRET,
+    {
+      expiresIn: AGV_SESSION_TTL,
+      issuer: "agv-subscription-server",
+      audience: "agv-platform",
+    }
+  );
+  return res.json({
+    ok: true,
+    token,
+    tokenType: "Bearer",
+    expiresIn: AGV_SESSION_TTL,
+    account: publicAccountPayload(account, account.plan),
+    message: "AGV host identity verified.",
+  });
+});
+
 app.post("/api/account/set-password", (req, res) => {
   const email = normalizeEmail(req.body.email || req.body.ownerEmail || req.body.accountEmail || "");
   const currentPassword = String(req.body.currentPassword || "");
