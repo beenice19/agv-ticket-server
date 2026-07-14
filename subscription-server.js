@@ -1,4 +1,4 @@
-require("dotenv").config();
+﻿require("dotenv").config();
 const express = require("express");
 const cors = require("cors");
 const fs = require("fs");
@@ -518,13 +518,20 @@ function upsertAccount(input = {}) {
   const data = readData();
 
   const cleanEmail = normalizeEmail(input.email || data.account?.email || "");
-  const cleanPlan = normalizePlan(input.plan || data.plan || "FREE");
-  const timestamp = nowIso();
-
-  const existingAccount =
+  // PASS_110_H2A_ACCOUNT_PLAN_LOCK
+  // Existing accounts retain their server-owned plan. New public accounts always start FREE.
+  const savedAccount =
     cleanEmail && data.accounts?.[cleanEmail]
       ? data.accounts[cleanEmail]
-      : data.account || {};
+      : data.account?.email === cleanEmail
+        ? data.account
+        : null;
+  const cleanPlan = savedAccount?.plan
+    ? normalizePlan(savedAccount.plan)
+    : "FREE";
+  const timestamp = nowIso();
+
+  const existingAccount = savedAccount || {};
 
   const accountId =
     existingAccount.accountId ||
@@ -551,10 +558,18 @@ function upsertAccount(input = {}) {
     lastBillingSyncAt: billing.lastBillingSyncAt,
   };
 
-  data.organizationId = nextAccount.accountId || data.organizationId || "agv-demo";
-  data.plan = cleanPlan;
+  // PASS_110_H2A_PRIMARY_ACCOUNT_LOCK
+  // Public account creation must not replace Byron's primary AGV account or shared plan.
+  const isPrimaryAccount =
+    !data.account?.email || normalizeEmail(data.account.email) === cleanEmail;
+
+  if (isPrimaryAccount) {
+    data.organizationId = nextAccount.accountId || data.organizationId || "agv-demo";
+    data.plan = cleanPlan;
+    data.account = nextAccount;
+  }
+
   data.updatedAt = timestamp;
-  data.account = nextAccount;
 
   if (!data.accounts || typeof data.accounts !== "object") {
     data.accounts = {};
@@ -626,6 +641,21 @@ app.get("/api/subscription", (req, res) => {
 });
 
 app.post("/api/subscription/plan", (req, res) => {
+  // PASS_110_H2A_LOCAL_ONLY_PLAN_CHANGE
+  // Temporary containment: only the AGV workstation may change subscription plans.
+  const remoteAddress = String(req.socket?.remoteAddress || req.ip || "");
+  const isLocalRequest =
+    remoteAddress === "127.0.0.1" ||
+    remoteAddress === "::1" ||
+    remoteAddress === "::ffff:127.0.0.1";
+
+  if (!isLocalRequest) {
+    return res.status(403).json({
+      ok: false,
+      error: "Subscription plan changes are restricted to the AGV workstation.",
+    });
+  }
+
   const requestedPlan = normalizePlan(req.body.plan);
 
   if (!PLAN_LIMITS[requestedPlan]) {
