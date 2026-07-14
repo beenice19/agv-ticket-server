@@ -1,11 +1,25 @@
-﻿require("dotenv").config();
+require("dotenv").config();
 const express = require("express");
 const cors = require("cors");
 const fs = require("fs");
 const path = require("path");
+const {
+  isSubscriptionPersistenceReady,
+  loadSubscriptionState,
+  saveSubscriptionState,
+} = require("./lib/subscriptionPersistence");
 
 const PORT = Number(process.env.PORT || 8792);
 const DATA_FILE = path.join(__dirname, "agv-subscription.json");
+
+const subscriptionPersistenceStatus = {
+  ready: isSubscriptionPersistenceReady(),
+  hydrated: false,
+  source: "LOCAL_JSON",
+  lastReadAt: "",
+  lastWriteAt: "",
+  lastError: "",
+};
 
 const app = express();
 
@@ -168,6 +182,27 @@ function defaultData() {
 
 function writeData(data) {
   fs.writeFileSync(DATA_FILE, JSON.stringify(data, null, 2), "utf8");
+
+  if (!isSubscriptionPersistenceReady()) {
+    return;
+  }
+
+  saveSubscriptionState(data)
+    .then((result) => {
+      if (result?.ok) {
+        subscriptionPersistenceStatus.ready = true;
+        subscriptionPersistenceStatus.lastWriteAt =
+          result.updatedAt || new Date().toISOString();
+        subscriptionPersistenceStatus.lastError = "";
+      } else {
+        subscriptionPersistenceStatus.lastError =
+          result?.error || result?.reason || "Supabase mirror failed.";
+      }
+    })
+    .catch((error) => {
+      subscriptionPersistenceStatus.lastError =
+        error?.message || "Supabase mirror failed.";
+    });
 }
 
 function migrateAccount(account = {}, fallback = {}) {
@@ -633,6 +668,14 @@ app.get("/health", (req, res) => {
     dataFile: DATA_FILE,
     enforcement: true,
     billingIdentity: true,
+    persistence: {
+      ready: subscriptionPersistenceStatus.ready,
+      hydrated: subscriptionPersistenceStatus.hydrated,
+      source: subscriptionPersistenceStatus.source,
+      lastReadAt: subscriptionPersistenceStatus.lastReadAt,
+      lastWriteAt: subscriptionPersistenceStatus.lastWriteAt,
+      lastError: subscriptionPersistenceStatus.lastError,
+    },
   });
 });
 
@@ -1076,10 +1119,60 @@ app.post("/api/account/upsert", (req, res) => {
   res.json(result);
 });
 
-app.listen(PORT, () => {
-  console.log("AGV SUBSCRIPTION + ACCOUNT SERVER RUNNING ON", PORT);
-  console.log("SUBSCRIPTION DATA FILE:", DATA_FILE);
-  console.log("ACCOUNT FOUNDATION: ENABLED");
-  console.log("PLAN ENFORCEMENT FOUNDATION: ENABLED");
-  console.log("STRIPE CUSTOMER FIELD FOUNDATION: ENABLED");
-});
+async function hydrateSubscriptionState() {
+  if (!isSubscriptionPersistenceReady()) {
+    subscriptionPersistenceStatus.ready = false;
+    subscriptionPersistenceStatus.source = "LOCAL_JSON";
+    return;
+  }
+
+  subscriptionPersistenceStatus.ready = true;
+  const result = await loadSubscriptionState();
+
+  if (result?.ok && result?.found && result?.payload) {
+    const hydratedData = migrateData(result.payload);
+    fs.writeFileSync(DATA_FILE, JSON.stringify(hydratedData, null, 2), "utf8");
+    subscriptionPersistenceStatus.hydrated = true;
+    subscriptionPersistenceStatus.source = "SUPABASE";
+    subscriptionPersistenceStatus.lastReadAt =
+      result.updatedAt || new Date().toISOString();
+    subscriptionPersistenceStatus.lastError = "";
+    return;
+  }
+
+  if (result?.ok && !result?.found) {
+    const localData = readData();
+    const seedResult = await saveSubscriptionState(localData);
+    subscriptionPersistenceStatus.source = "LOCAL_JSON_SEEDED";
+    subscriptionPersistenceStatus.lastWriteAt = seedResult?.updatedAt || "";
+    subscriptionPersistenceStatus.lastError = seedResult?.ok
+      ? ""
+      : seedResult?.error || seedResult?.reason || "Supabase seed failed.";
+    return;
+  }
+
+  subscriptionPersistenceStatus.source = "LOCAL_JSON_FALLBACK";
+  subscriptionPersistenceStatus.lastError =
+    result?.error || result?.reason || "Supabase hydration failed.";
+}
+
+async function startSubscriptionServer() {
+  try {
+    await hydrateSubscriptionState();
+  } catch (error) {
+    subscriptionPersistenceStatus.source = "LOCAL_JSON_FALLBACK";
+    subscriptionPersistenceStatus.lastError =
+      error?.message || "Supabase startup hydration failed.";
+  }
+
+  app.listen(PORT, () => {
+    console.log("AGV SUBSCRIPTION + ACCOUNT SERVER RUNNING ON", PORT);
+    console.log("SUBSCRIPTION DATA FILE:", DATA_FILE);
+    console.log("SUBSCRIPTION PERSISTENCE:", subscriptionPersistenceStatus.source);
+    console.log("ACCOUNT FOUNDATION: ENABLED");
+    console.log("PLAN ENFORCEMENT FOUNDATION: ENABLED");
+    console.log("STRIPE CUSTOMER FIELD FOUNDATION: ENABLED");
+  });
+}
+
+startSubscriptionServer();
