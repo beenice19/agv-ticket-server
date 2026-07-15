@@ -10,6 +10,7 @@ const express = require("express");
 const cors = require("cors");
 const Stripe = require("stripe");
 const crypto = require("crypto");
+const jwt = require("jsonwebtoken");
 
 const app = express();
 
@@ -66,6 +67,104 @@ function requireInternalService(req, res, next) {
     });
   }
 
+  next();
+}
+
+// CONTROL_LIST_1A2B_VERIFIED_HOST_JWT
+const SESSION_SECRET = String(process.env.AGV_SESSION_SECRET || "").trim();
+function requireVerifiedHost(req, res, next) {
+  if (!SESSION_SECRET) {
+    return res.status(503).json({
+      ok: false,
+      error: "Verified host authentication is not configured.",
+    });
+  }
+  const authorization = safeText(req.get("authorization"));
+  const match = authorization.match(/^Bearer\s+(.+)$/i);
+  if (!match) {
+    return res.status(401).json({
+      ok: false,
+      error: "Verified host authentication required.",
+    });
+  }
+  try {
+    const payload = jwt.verify(match[1], SESSION_SECRET, {
+      issuer: "agv-subscription-server",
+      audience: "agv-platform",
+    });
+    if (
+      payload?.tokenType !== "agv_host_session" ||
+      !safeEmail(payload?.email)
+    ) {
+      return res.status(401).json({
+        ok: false,
+        error: "Invalid AGV host session.",
+      });
+    }
+    req.agvHost = {
+      accountId: safeText(payload.sub),
+      email: safeEmail(payload.email),
+      role: safeText(payload.role || "owner").toLowerCase(),
+      plan: safeText(payload.plan || "FREE").toUpperCase(),
+    };
+    next();
+  } catch {
+    return res.status(401).json({
+      ok: false,
+      error: "Invalid or expired AGV host session.",
+    });
+  }
+}
+const PLATFORM_ADMIN_EMAILS = new Set(
+  String(process.env.AGV_PLATFORM_ADMIN_EMAILS || "")
+    .split(",")
+    .map(safeEmail)
+    .filter(Boolean)
+);
+function requirePlatformAdmin(req, res, next) {
+  if (!PLATFORM_ADMIN_EMAILS.size) {
+    return res.status(503).json({
+      ok: false,
+      error: "AGV platform administration is not configured.",
+    });
+  }
+  if (!PLATFORM_ADMIN_EMAILS.has(req.agvHost?.email)) {
+    return res.status(403).json({
+      ok: false,
+      error: "AGV platform administrator authorization required.",
+    });
+  }
+  next();
+}
+function requireVendorOwnership(req, res, next) {
+  const requestData = {
+    ...(req.query || {}),
+    ...(req.body || {}),
+  };
+  const suppliedEmail = safeEmail(requestData.email);
+  const vendorId = safeText(requestData.vendorId);
+  if (suppliedEmail && suppliedEmail !== req.agvHost?.email) {
+    return res.status(403).json({
+      ok: false,
+      error: "Vendor profile access denied.",
+    });
+  }
+  if (vendorId) {
+    const data = readVendors();
+    const vendor = findVendor(data, { vendorId });
+    if (!vendor || safeEmail(vendor.email) !== req.agvHost?.email) {
+      return res.status(403).json({
+        ok: false,
+        error: "Vendor profile access denied.",
+      });
+    }
+  }
+  if (req.body && !suppliedEmail) {
+    req.body.email = req.agvHost.email;
+  }
+  if (req.query && !suppliedEmail && !vendorId) {
+    req.query.email = req.agvHost.email;
+  }
   next();
 }
 
@@ -197,7 +296,7 @@ app.get("/api/vendor/health", (req, res) => {
   });
 });
 
-app.post("/api/vendor/register", (req, res) => {
+app.post("/api/vendor/register", requireVerifiedHost, requireVendorOwnership, (req, res) => {
   const result = upsertVendor(req.body || {});
 
   if (result.error) {
@@ -210,7 +309,7 @@ app.post("/api/vendor/register", (req, res) => {
   });
 });
 
-app.post("/api/vendor/update", (req, res) => {
+app.post("/api/vendor/update", requireVerifiedHost, requireVendorOwnership, (req, res) => {
   const result = upsertVendor(req.body || {});
 
   if (result.error) {
@@ -223,7 +322,7 @@ app.post("/api/vendor/update", (req, res) => {
   });
 });
 
-app.get("/api/vendor/status", async (req, res) => {
+app.get("/api/vendor/status", requireVerifiedHost, requireVendorOwnership, async (req, res) => {
   const data = readVendors();
   const vendor = findVendor(data, req.query || {});
 
@@ -345,7 +444,7 @@ app.get("/api/vendor/internal/payment-routing", requireInternalService, async (r
   });
 });
 
-app.get("/api/vendor/list", (req, res) => {
+app.get("/api/vendor/list", requireVerifiedHost, requirePlatformAdmin, (req, res) => {
   const data = readVendors();
 
   res.json({
@@ -354,7 +453,7 @@ app.get("/api/vendor/list", (req, res) => {
   });
 });
 
-app.post("/api/vendor/approve", (req, res) => {
+app.post("/api/vendor/approve", requireVerifiedHost, requirePlatformAdmin, (req, res) => {
   const data = readVendors();
   const vendor = findVendor(data, req.body || {});
 
@@ -374,7 +473,7 @@ app.post("/api/vendor/approve", (req, res) => {
   });
 });
 
-app.post("/api/vendor/suspend", (req, res) => {
+app.post("/api/vendor/suspend", requireVerifiedHost, requirePlatformAdmin, (req, res) => {
   const data = readVendors();
   const vendor = findVendor(data, req.body || {});
 
@@ -394,7 +493,7 @@ app.post("/api/vendor/suspend", (req, res) => {
   });
 });
 
-app.post("/api/vendor/connect/stripe", async (req, res) => {
+app.post("/api/vendor/connect/stripe", requireVerifiedHost, requireVendorOwnership, async (req, res) => {
   try {
     if (!stripe) {
       return res.status(400).json({
@@ -467,7 +566,7 @@ app.post("/api/vendor/connect/stripe", async (req, res) => {
   }
 });
 
-app.post("/api/vendor/connect/agv-gateway", (req, res) => {
+app.post("/api/vendor/connect/agv-gateway", requireVerifiedHost, requireVendorOwnership, (req, res) => {
   const result = upsertVendor({
     ...req.body,
     gateway: "AGV_GATEWAY",
@@ -490,7 +589,9 @@ app.post("/api/vendor/connect/agv-gateway", (req, res) => {
     message: "AGV Stripe Gateway selected. AGV will collect ticket payments and track host/vendor settlement.",
     vendor: publicVendor(result.vendor),
   });
-});app.post("/api/vendor/connect/paypal", (req, res) => {
+});
+
+app.post("/api/vendor/connect/paypal", requireVerifiedHost, requireVendorOwnership, (req, res) => {
   const result = upsertVendor({
     ...req.body,
     gateway: "PAYPAL",
@@ -514,7 +615,7 @@ app.post("/api/vendor/connect/agv-gateway", (req, res) => {
   });
 });
 
-app.post("/api/vendor/connect/square", (req, res) => {
+app.post("/api/vendor/connect/square", requireVerifiedHost, requireVendorOwnership, (req, res) => {
   const result = upsertVendor({
     ...req.body,
     gateway: "SQUARE",
@@ -538,7 +639,7 @@ app.post("/api/vendor/connect/square", (req, res) => {
   });
 });
 
-app.post("/api/vendor/connect/manual", (req, res) => {
+app.post("/api/vendor/connect/manual", requireVerifiedHost, requireVendorOwnership, (req, res) => {
   const result = upsertVendor({
     ...req.body,
     gateway: "MANUAL",
