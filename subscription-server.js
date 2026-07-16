@@ -12,6 +12,70 @@ const {
 const PORT = Number(process.env.PORT || 8792);
 const DATA_FILE = path.join(__dirname, "agv-subscription.json");
 
+// AGV_NETWORK_CONTROL_2_SERVER_REGISTRY
+// Public reads are open. Writes require a verified AGV session whose email
+// appears in the server-controlled AGV_SUPER_ADMIN_EMAILS environment variable.
+const AGV_SUPER_ADMIN_EMAILS = new Set(
+  String(process.env.AGV_SUPER_ADMIN_EMAILS || "")
+    .split(",")
+    .map((email) => email.trim().toLowerCase())
+    .filter(Boolean)
+);
+
+const DEFAULT_NETWORK_STATIONS = Object.freeze([
+  {
+    id: "earth-from-space",
+    title: "Earth From Space",
+    source: "NASA",
+    categoryId: "space-observatories",
+    category: "Space & Observatories",
+    badge: "LIVE",
+    schedule: "24/7",
+    videoId: "awQzjn72bI0",
+    thumbnail: "",
+    description: "Live views of Earth from orbit.",
+    attribution: "External public stream supplied by its source provider.",
+    fallbackVideoId: "",
+    enabled: true,
+    rightsStatus: "APPROVED_EMBED",
+    healthStatus: "ONLINE",
+  },
+  {
+    id: "monterey-bay-live",
+    title: "Monterey Bay Live",
+    source: "Monterey Bay Aquarium",
+    categoryId: "ocean-nature",
+    category: "Ocean & Nature",
+    badge: "LIVE",
+    schedule: "24/7",
+    videoId: "fVa6-zCBR7A",
+    thumbnail: "",
+    description: "A live public view from Monterey Bay.",
+    attribution: "External public stream supplied by its source provider.",
+    fallbackVideoId: "",
+    enabled: true,
+    rightsStatus: "APPROVED_EMBED",
+    healthStatus: "ONLINE",
+  },
+  {
+    id: "moon-jelly-cam",
+    title: "Moon Jelly Cam",
+    source: "Monterey Bay Aquarium",
+    categoryId: "ocean-nature",
+    category: "Ocean & Nature",
+    badge: "LIVE",
+    schedule: "24/7",
+    videoId: "IEGYa3FlY1s",
+    thumbnail: "",
+    description: "A live public moon-jelly viewing experience.",
+    attribution: "External public stream supplied by its source provider.",
+    fallbackVideoId: "",
+    enabled: true,
+    rightsStatus: "APPROVED_EMBED",
+    healthStatus: "ONLINE",
+  },
+]);
+
 const subscriptionPersistenceStatus = {
   ready: isSubscriptionPersistenceReady(),
   hydrated: false,
@@ -168,6 +232,73 @@ function defaultAccount(createdAt, plan = "FREE") {
   };
 }
 
+function cleanNetworkStationId(value) {
+  return String(value || "")
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "");
+}
+
+function normalizeNetworkStation(station = {}, index = 0) {
+  const title = cleanText(
+    station.title || `AGV Network Station ${index + 1}`
+  );
+
+  const id =
+    cleanNetworkStationId(station.id || title) ||
+    `agv-network-station-${index + 1}`;
+
+  return {
+    id,
+    title,
+    source: cleanText(station.source || ""),
+    categoryId:
+      cleanNetworkStationId(station.categoryId || "uncategorized") ||
+      "uncategorized",
+    category: cleanText(station.category || "Uncategorized"),
+    badge: cleanText(station.badge || "LIVE"),
+    schedule: cleanText(station.schedule || "24/7"),
+    videoId: cleanText(station.videoId || ""),
+    thumbnail: cleanText(station.thumbnail || ""),
+    description: cleanText(station.description || ""),
+    attribution: cleanText(station.attribution || ""),
+    fallbackVideoId: cleanText(station.fallbackVideoId || ""),
+    enabled: station.enabled !== false,
+    rightsStatus: cleanText(
+      station.rightsStatus || "PENDING_REVIEW"
+    ),
+    healthStatus: cleanText(
+      station.healthStatus || "UNKNOWN"
+    ),
+  };
+}
+
+function normalizeNetworkStations(value) {
+  const source =
+    Array.isArray(value) && value.length
+      ? value
+      : DEFAULT_NETWORK_STATIONS;
+
+  const seen = new Set();
+
+  return source
+    .map(normalizeNetworkStation)
+    .filter((station) => {
+      if (
+        !station.id ||
+        !station.title ||
+        !station.videoId ||
+        seen.has(station.id)
+      ) {
+        return false;
+      }
+
+      seen.add(station.id);
+      return true;
+    });
+}
+
 function defaultData() {
   const createdAt = nowIso();
 
@@ -177,6 +308,9 @@ function defaultData() {
     updatedAt: createdAt,
     account: defaultAccount(createdAt, "FREE"),
     accounts: {},
+    networkStations: normalizeNetworkStations(
+      DEFAULT_NETWORK_STATIONS
+    ),
   };
 }
 
@@ -296,6 +430,10 @@ function migrateData(data) {
       plan: migrated.account.plan,
     };
   }
+
+  migrated.networkStations = normalizeNetworkStations(
+    migrated.networkStations
+  );
 
   return migrated;
 }
@@ -678,6 +816,161 @@ app.get("/health", (req, res) => {
     },
   });
 });
+
+function getAgvBearerToken(req) {
+  const authorization = String(
+    req.headers.authorization || ""
+  ).trim();
+
+  if (!authorization.toLowerCase().startsWith("bearer ")) {
+    return "";
+  }
+
+  return authorization.slice(7).trim();
+}
+
+function requireNetworkSuperAdmin(req, res, next) {
+  if (!AGV_SESSION_SECRET) {
+    return res.status(503).json({
+      ok: false,
+      error: "Verified AGV session authentication is not configured.",
+    });
+  }
+
+  if (!AGV_SUPER_ADMIN_EMAILS.size) {
+    return res.status(503).json({
+      ok: false,
+      error: "AGV Super Admin email authorization is not configured.",
+    });
+  }
+
+  const token = getAgvBearerToken(req);
+
+  if (!token) {
+    return res.status(401).json({
+      ok: false,
+      error: "A verified AGV session token is required.",
+    });
+  }
+
+  try {
+    const claims = agvHostSessionJwt.verify(
+      token,
+      AGV_SESSION_SECRET,
+      {
+        issuer: "agv-subscription-server",
+        audience: "agv-platform",
+      }
+    );
+
+    const email = normalizeEmail(claims?.email || "");
+
+    if (
+      claims?.tokenType !== "agv_host_session" ||
+      !email ||
+      !AGV_SUPER_ADMIN_EMAILS.has(email)
+    ) {
+      return res.status(403).json({
+        ok: false,
+        error: "AGV Super Admin authorization is required.",
+      });
+    }
+
+    req.agvNetworkAdmin = {
+      sub: claims.sub,
+      email,
+    };
+
+    return next();
+  } catch {
+    return res.status(401).json({
+      ok: false,
+      error: "The AGV session token is invalid or expired.",
+    });
+  }
+}
+
+app.get("/api/network/stations", (req, res) => {
+  const data = readData();
+  const stations = normalizeNetworkStations(
+    data.networkStations
+  ).filter((station) => station.enabled !== false);
+
+  return res.json({
+    ok: true,
+    stations,
+    count: stations.length,
+    updatedAt:
+      data.networkStationsUpdatedAt ||
+      data.updatedAt ||
+      "",
+  });
+});
+
+app.get(
+  "/api/network/stations/admin",
+  requireNetworkSuperAdmin,
+  (req, res) => {
+    const data = readData();
+    const stations = normalizeNetworkStations(
+      data.networkStations
+    );
+
+    return res.json({
+      ok: true,
+      stations,
+      count: stations.length,
+      updatedAt:
+        data.networkStationsUpdatedAt ||
+        data.updatedAt ||
+        "",
+    });
+  }
+);
+
+app.put(
+  "/api/network/stations",
+  requireNetworkSuperAdmin,
+  (req, res) => {
+    if (!Array.isArray(req.body?.stations)) {
+      return res.status(400).json({
+        ok: false,
+        error: "A stations array is required.",
+      });
+    }
+
+    const stations = normalizeNetworkStations(
+      req.body.stations
+    );
+
+    if (!stations.length) {
+      return res.status(400).json({
+        ok: false,
+        error: "At least one valid AGV Network station is required.",
+      });
+    }
+
+    const data = readData();
+    const timestamp = nowIso();
+
+    data.networkStations = stations;
+    data.networkStationsUpdatedAt = timestamp;
+    data.networkStationsUpdatedBy =
+      req.agvNetworkAdmin.email;
+    data.updatedAt = timestamp;
+
+    writeData(data);
+
+    return res.json({
+      ok: true,
+      stations,
+      count: stations.length,
+      updatedAt: timestamp,
+      updatedBy: req.agvNetworkAdmin.email,
+      message: "AGV Network station registry saved.",
+    });
+  }
+);
 
 app.get("/api/subscription", (req, res) => {
   res.json(getSubscriptionPayload());
