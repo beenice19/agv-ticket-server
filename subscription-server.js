@@ -252,7 +252,15 @@ function normalizeNetworkStation(station = {}, index = 0) {
   return {
     id,
     title,
-    source: cleanText(station.source || ""),
+    source: cleanText(station.source || station.provider || ""),
+    provider: cleanText(station.provider || station.source || ""),
+    sourceType: cleanText(
+      station.sourceType ||
+      (station.videoId ? "YOUTUBE" : "DIRECT_MP4")
+    ).toUpperCase(),
+    sourceUrl: cleanText(station.sourceUrl || ""),
+    embedUrl: cleanText(station.embedUrl || ""),
+    fallbackUrl: cleanText(station.fallbackUrl || ""),
     categoryId:
       cleanNetworkStationId(station.categoryId || "uncategorized") ||
       "uncategorized",
@@ -285,10 +293,18 @@ function normalizeNetworkStations(value) {
   return source
     .map(normalizeNetworkStation)
     .filter((station) => {
+      const sourceType = String(station.sourceType || "").toUpperCase();
+      const hasPlayableSource =
+        (sourceType === "YOUTUBE" && Boolean(station.videoId)) ||
+        (sourceType === "DIRECT_MP4" && Boolean(station.sourceUrl)) ||
+        (sourceType === "IFRAME" && Boolean(station.embedUrl || station.sourceUrl)) ||
+        (sourceType === "HLS" && Boolean(station.sourceUrl)) ||
+        (sourceType === "DASH" && Boolean(station.sourceUrl));
+
       if (
         !station.id ||
         !station.title ||
-        !station.videoId ||
+        !hasPlayableSource ||
         seen.has(station.id)
       ) {
         return false;
