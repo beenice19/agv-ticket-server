@@ -296,7 +296,9 @@ function normalizeNetworkStations(value) {
       const sourceType = String(station.sourceType || "").toUpperCase();
       const hasPlayableSource =
         (sourceType === "YOUTUBE" && Boolean(station.videoId)) ||
-        (sourceType === "DIRECT_MP4" && Boolean(station.sourceUrl)) ||
+        ((sourceType === "DIRECT_MP4" ||
+          sourceType === "DIRECT_WEBM") &&
+          Boolean(station.sourceUrl)) ||
         (sourceType === "IFRAME" && Boolean(station.embedUrl || station.sourceUrl)) ||
         (sourceType === "HLS" && Boolean(station.sourceUrl)) ||
         (sourceType === "DASH" && Boolean(station.sourceUrl));
