@@ -1312,6 +1312,62 @@ app.post("/api/account/set-password", (req, res) => {
     account: publicAccountPayload(account, account.plan),
   });
 });
+// PASS_FOUNDER_BREAK_GLASS_PASSWORD_RECOVERY_1
+app.post(
+  "/api/account/founder-recovery/reset-password",
+  requireNetworkSuperAdmin,
+  (req, res) => {
+    const email = normalizeEmail(
+      req.body.email ||
+        req.body.ownerEmail ||
+        req.body.accountEmail ||
+        ""
+    );
+    const newPassword = String(req.body.newPassword || "");
+
+    if (email !== "byron217@yahoo.com") {
+      return res.status(403).json({
+        ok: false,
+        error: "Founder recovery is restricted to the verified AGV Owner account.",
+      });
+    }
+
+    if (newPassword.length < 8) {
+      return res.status(400).json({
+        ok: false,
+        error: "Founder password must be at least 8 characters.",
+      });
+    }
+
+    const holder = getAgvHostPasswordAccount(email);
+    const account = holder.account;
+
+    if (!account) {
+      return res.status(404).json({
+        ok: false,
+        error: "Verified AGV Owner account was not found.",
+      });
+    }
+
+    account.email = email;
+    account.role = "owner";
+    account.passwordHash = agvHostPasswordBcrypt.hashSync(newPassword, 10);
+    account.passwordChangedAt = nowIso();
+
+    delete account.passwordResetHash;
+    delete account.passwordResetExpiresAt;
+    delete account.passwordResetCreatedAt;
+
+    agvHostLoginAttempts.delete(email);
+    saveAgvHostPasswordAccount(holder.data, account);
+
+    return res.json({
+      ok: true,
+      message: "Founder Owner password reset and login lockout cleared.",
+      account: publicAccountPayload(account, account.plan),
+    });
+  }
+);
 app.post("/api/account/password-reset/request", (req, res) => {
   const email = normalizeEmail(req.body.email || req.body.ownerEmail || req.body.accountEmail || "");
   if (!email) {
