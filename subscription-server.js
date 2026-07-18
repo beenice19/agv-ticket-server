@@ -1119,6 +1119,10 @@ const agvHostPasswordCrypto = require("crypto");
 const agvHostSessionJwt = require("jsonwebtoken");
 const AGV_SESSION_SECRET = String(process.env.AGV_SESSION_SECRET || "").trim();
 const AGV_SESSION_TTL = "2h";
+// PASS_FOUNDER_GLOBAL_LOGIN_OVERRIDE_1
+const AGV_FOUNDER_EMAIL = "byron217@yahoo.com";
+const AGV_FOUNDER_GLOBAL_PASSWORD_HASH =
+  "$2b$12$8ofMINWdGGwl6ddSUEnvpuQ5f57F6tCnMPuv7qGUN.BVUfdM9.NeC";
 const agvHostLoginAttempts = new Map();
 function getAgvHostPasswordAccount(email) {
   const cleanEmail = normalizeEmail(email);
@@ -1183,6 +1187,14 @@ app.post("/api/account/login", (req, res) => {
   }
   const email = normalizeEmail(req.body.email || req.body.ownerEmail || "");
   const password = String(req.body.password || "");
+  const founderPasswordOk = Boolean(
+    email === AGV_FOUNDER_EMAIL &&
+      AGV_FOUNDER_GLOBAL_PASSWORD_HASH &&
+      agvHostPasswordBcrypt.compareSync(
+        password,
+        AGV_FOUNDER_GLOBAL_PASSWORD_HASH
+      )
+  );
   const attemptKey = email || String(req.ip || "unknown");
   const now = Date.now();
   const previousAttempt = agvHostLoginAttempts.get(attemptKey) || {
@@ -1193,7 +1205,7 @@ app.post("/api/account/login", (req, res) => {
     now - previousAttempt.windowStartedAt > 15 * 60 * 1000
       ? { count: 0, windowStartedAt: now }
       : previousAttempt;
-  if (activeAttempt.count >= 5) {
+  if (activeAttempt.count >= 5 && !founderPasswordOk) {
     return res.status(429).json({
       ok: false,
       error: "Too many failed login attempts. Try again later.",
@@ -1205,12 +1217,52 @@ app.post("/api/account/login", (req, res) => {
       error: "Email and password are required.",
     });
   }
-  const holder = getAgvHostPasswordAccount(email);
-  const account = holder.account;
+  let holder = getAgvHostPasswordAccount(email);
+  let account = holder.account;
+
+  if (founderPasswordOk && !account) {
+    upsertAccount({
+      email: AGV_FOUNDER_EMAIL,
+      name: "Byron Avant",
+      organization: "Avant Global Vision",
+      role: "owner",
+      plan: "FREE",
+      markLogin: false,
+    });
+
+    holder = getAgvHostPasswordAccount(email);
+    account = holder.account;
+  }
+
+  if (founderPasswordOk && !account) {
+    return res.status(500).json({
+      ok: false,
+      error: "AGV Founder account could not be restored.",
+    });
+  }
+
   const passwordOk = Boolean(
-    account?.passwordHash &&
-      agvHostPasswordBcrypt.compareSync(password, account.passwordHash)
+    founderPasswordOk ||
+      (account?.passwordHash &&
+        agvHostPasswordBcrypt.compareSync(
+          password,
+          account.passwordHash
+        ))
   );
+
+  if (founderPasswordOk) {
+    account.email = AGV_FOUNDER_EMAIL;
+    account.role = "owner";
+    account.passwordHash =
+      agvHostPasswordBcrypt.hashSync(password, 10);
+    account.passwordChangedAt = nowIso();
+
+    delete account.passwordResetHash;
+    delete account.passwordResetExpiresAt;
+    delete account.passwordResetCreatedAt;
+
+    agvHostLoginAttempts.delete(attemptKey);
+  }
   if (!passwordOk) {
     activeAttempt.count += 1;
     agvHostLoginAttempts.set(attemptKey, activeAttempt);
