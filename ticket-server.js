@@ -8,10 +8,11 @@ const crypto = require("crypto");
 const Stripe = require("stripe");
 const { createClient } = require("@supabase/supabase-js"); // PASS_LIVE_TICKET_PERSISTENCE_1A
 const app = express();
-const PORT = Number(process.env.PORT || process.env.TICKET_SERVER_PORT || 8790);
+const PORT = Number(process.env.TICKET_SERVER_PORT || process.env.PORT || 8797);
 const DATA_FILE = path.join(__dirname, "agv-tickets.json");
 const CHECKOUTS_FILE = path.join(__dirname, "agv-ticket-checkouts.json");
 const HOST_LEDGER_FILE = path.join(__dirname, "agv-host-balance-ledger.json"); // LC2-02B_HOST_BALANCE_LEDGER_ENGINE
+const HOST_SETTLEMENTS_FILE = path.join(__dirname, "agv-host-settlements.json"); // LC2-04D_HOST_SETTLEMENT_ENGINE
 const STRIPE_SECRET_KEY = process.env.STRIPE_SECRET_KEY || "";
 const stripe = STRIPE_SECRET_KEY ? Stripe(STRIPE_SECRET_KEY) : null;
 const SUPABASE_URL = String(process.env.SUPABASE_URL || "").trim(); // PASS_LIVE_TICKET_PERSISTENCE_1A
@@ -296,6 +297,289 @@ function creditHostLedger({
     credited: true,
     duplicate: false,
     entry,
+    account: updatedAccount,
+  };
+}
+// LC2-04D_HOST_SETTLEMENT_ENGINE
+function emptyHostSettlements() {
+  return {
+    version: 1,
+    updatedAt: new Date().toISOString(),
+    settlements: [],
+  };
+}
+
+function readHostSettlements() {
+  const parsed = readJsonFile(HOST_SETTLEMENTS_FILE, emptyHostSettlements());
+  return {
+    version: Number(parsed?.version || 1),
+    updatedAt: parsed?.updatedAt || new Date().toISOString(),
+    settlements: Array.isArray(parsed?.settlements)
+      ? parsed.settlements
+      : [],
+  };
+}
+
+function writeHostSettlements(data) {
+  const normalized = {
+    version: 1,
+    updatedAt: new Date().toISOString(),
+    settlements: Array.isArray(data?.settlements)
+      ? data.settlements
+      : [],
+  };
+
+  const temporaryFile = `${HOST_SETTLEMENTS_FILE}.tmp`;
+  fs.writeFileSync(
+    temporaryFile,
+    JSON.stringify(normalized, null, 2),
+    "utf8"
+  );
+  fs.renameSync(temporaryFile, HOST_SETTLEMENTS_FILE);
+  return normalized;
+}
+
+function commitHostSettlementState(ledger, settlementData) {
+  const ledgerExisted = fs.existsSync(HOST_LEDGER_FILE);
+  const settlementsExisted = fs.existsSync(HOST_SETTLEMENTS_FILE);
+  const previousLedger = ledgerExisted
+    ? fs.readFileSync(HOST_LEDGER_FILE, "utf8")
+    : null;
+  const previousSettlements = settlementsExisted
+    ? fs.readFileSync(HOST_SETTLEMENTS_FILE, "utf8")
+    : null;
+
+  try {
+    writeHostLedger(ledger);
+    writeHostSettlements(settlementData);
+  } catch (error) {
+    try {
+      if (ledgerExisted) {
+        fs.writeFileSync(HOST_LEDGER_FILE, previousLedger, "utf8");
+      } else if (fs.existsSync(HOST_LEDGER_FILE)) {
+        fs.unlinkSync(HOST_LEDGER_FILE);
+      }
+
+      if (settlementsExisted) {
+        fs.writeFileSync(
+          HOST_SETTLEMENTS_FILE,
+          previousSettlements,
+          "utf8"
+        );
+      } else if (fs.existsSync(HOST_SETTLEMENTS_FILE)) {
+        fs.unlinkSync(HOST_SETTLEMENTS_FILE);
+      }
+    } catch (rollbackError) {
+      console.error(
+        "HOST SETTLEMENT STATE ROLLBACK FAILED:",
+        rollbackError.message
+      );
+    }
+
+    throw error;
+  }
+}
+function makeHostSettlementId() {
+  return `hse_${crypto.randomBytes(12).toString("hex")}`;
+}
+
+function releasePendingHostFunds({
+  hostId,
+  amountCents,
+  sourceId,
+  note = "",
+}) {
+  const normalizedHostId = normalizeLedgerHostId(hostId);
+  const normalizedSourceId = String(sourceId || "").trim();
+  const safeAmountCents = Math.round(Number(amountCents || 0));
+
+  if (!normalizedHostId) {
+    throw new Error("Host settlement release requires hostId.");
+  }
+
+  if (!normalizedSourceId) {
+    throw new Error("Host settlement release requires sourceId.");
+  }
+
+  if (!Number.isFinite(safeAmountCents) || safeAmountCents <= 0) {
+    throw new Error("Host settlement release amount must be greater than zero.");
+  }
+
+  const ledger = readHostLedger();
+  const settlementData = readHostSettlements();
+  const idempotencyKey =
+    `RELEASE:${normalizedHostId}:${normalizedSourceId}`;
+
+  const existingSettlement = settlementData.settlements.find(
+    (item) => item?.idempotencyKey === idempotencyKey
+  );
+
+  if (existingSettlement) {
+    return {
+      released: false,
+      duplicate: true,
+      settlement: existingSettlement,
+      account: getHostLedgerAccount(ledger, normalizedHostId),
+    };
+  }
+
+  const account = getHostLedgerAccount(ledger, normalizedHostId);
+
+  if (safeAmountCents > account.pendingBalanceCents) {
+    throw new Error("Settlement release exceeds the host pending balance.");
+  }
+
+  const now = new Date().toISOString();
+  const settlement = {
+    settlementId: makeHostSettlementId(),
+    idempotencyKey,
+    hostId: normalizedHostId,
+    settlementType: "PENDING_TO_AVAILABLE",
+    amountCents: safeAmountCents,
+    sourceId: normalizedSourceId,
+    status: "COMPLETED",
+    note: String(note || "").trim(),
+    createdAt: now,
+    completedAt: now,
+  };
+
+  const updatedAccount = {
+    ...account,
+    pendingBalanceCents:
+      account.pendingBalanceCents - safeAmountCents,
+    availableBalanceCents:
+      account.availableBalanceCents + safeAmountCents,
+    lastLedgerEntryAt: now,
+    updatedAt: now,
+  };
+
+  ledger.accounts[normalizedHostId] = updatedAccount;
+  ledger.entries.unshift({
+    entryId: `hle_${crypto.randomBytes(12).toString("hex")}`,
+    idempotencyKey,
+    hostId: normalizedHostId,
+    entryType: "TRANSFER",
+    balanceBucket: "PENDING_TO_AVAILABLE",
+    sourceType: "SETTLEMENT_RELEASE",
+    sourceId: normalizedSourceId,
+    amountCents: safeAmountCents,
+    settlementId: settlement.settlementId,
+    status: "COMPLETED",
+    createdAt: now,
+  });
+
+  settlementData.settlements.unshift(settlement);
+  commitHostSettlementState(ledger, settlementData);
+
+  return {
+    released: true,
+    duplicate: false,
+    settlement,
+    account: updatedAccount,
+  };
+}
+
+function recordHostPayout({
+  hostId,
+  amountCents,
+  sourceId,
+  settlementMethod = "MANUAL",
+  externalReference = "",
+  note = "",
+}) {
+  const normalizedHostId = normalizeLedgerHostId(hostId);
+  const normalizedSourceId = String(sourceId || "").trim();
+  const safeAmountCents = Math.round(Number(amountCents || 0));
+  const normalizedMethod = String(settlementMethod || "MANUAL")
+    .trim()
+    .toUpperCase();
+
+  if (!normalizedHostId) {
+    throw new Error("Host payout requires hostId.");
+  }
+
+  if (!normalizedSourceId) {
+    throw new Error("Host payout requires sourceId.");
+  }
+
+  if (!Number.isFinite(safeAmountCents) || safeAmountCents <= 0) {
+    throw new Error("Host payout amount must be greater than zero.");
+  }
+
+  const ledger = readHostLedger();
+  const settlementData = readHostSettlements();
+  const idempotencyKey =
+    `PAYOUT:${normalizedHostId}:${normalizedSourceId}`;
+
+  const existingSettlement = settlementData.settlements.find(
+    (item) => item?.idempotencyKey === idempotencyKey
+  );
+
+  if (existingSettlement) {
+    return {
+      paid: false,
+      duplicate: true,
+      settlement: existingSettlement,
+      account: getHostLedgerAccount(ledger, normalizedHostId),
+    };
+  }
+
+  const account = getHostLedgerAccount(ledger, normalizedHostId);
+
+  if (safeAmountCents > account.availableBalanceCents) {
+    throw new Error("Host payout exceeds the available balance.");
+  }
+
+  const now = new Date().toISOString();
+  const settlement = {
+    settlementId: makeHostSettlementId(),
+    idempotencyKey,
+    hostId: normalizedHostId,
+    settlementType: "HOST_PAYOUT",
+    settlementMethod: normalizedMethod,
+    amountCents: safeAmountCents,
+    sourceId: normalizedSourceId,
+    externalReference: String(externalReference || "").trim(),
+    status: "PAID",
+    note: String(note || "").trim(),
+    createdAt: now,
+    paidAt: now,
+  };
+
+  const updatedAccount = {
+    ...account,
+    availableBalanceCents:
+      account.availableBalanceCents - safeAmountCents,
+    lifetimePayoutsCents:
+      account.lifetimePayoutsCents + safeAmountCents,
+    lastLedgerEntryAt: now,
+    updatedAt: now,
+  };
+
+  ledger.accounts[normalizedHostId] = updatedAccount;
+  ledger.entries.unshift({
+    entryId: `hle_${crypto.randomBytes(12).toString("hex")}`,
+    idempotencyKey,
+    hostId: normalizedHostId,
+    entryType: "DEBIT",
+    balanceBucket: "AVAILABLE",
+    sourceType: "HOST_PAYOUT",
+    sourceId: normalizedSourceId,
+    amountCents: safeAmountCents,
+    settlementId: settlement.settlementId,
+    settlementMethod: normalizedMethod,
+    externalReference: settlement.externalReference,
+    status: "PAID",
+    createdAt: now,
+  });
+
+  settlementData.settlements.unshift(settlement);
+  commitHostSettlementState(ledger, settlementData);
+
+  return {
+    paid: true,
+    duplicate: false,
+    settlement,
     account: updatedAccount,
   };
 }
@@ -949,6 +1233,63 @@ app.post("/api/tickets/verify", async (req, res) => {
     roomId: ticket.roomId || "main-hall",
     message: "Ticket approved.",
   });
+});
+app.get("/api/tickets/admin/host-ledger", requireTicketAdmin, (req, res) => {
+
+  try {
+    const hostId = normalizeLedgerHostId(req.query?.hostId);
+    const ledger = readHostLedger();
+
+    if (hostId) {
+      return res.json({
+        ok: true,
+        hostId,
+        account: getHostLedgerAccount(ledger, hostId),
+        entries: ledger.entries.filter(
+          (entry) => entry?.hostId === hostId
+        ),
+      });
+    }
+
+    return res.json({
+      ok: true,
+      accountCount: Object.keys(ledger.accounts).length,
+      entryCount: ledger.entries.length,
+      ledger,
+    });
+  } catch (error) {
+    console.error("HOST LEDGER READ ERROR:", error);
+    return res.status(500).json({
+      ok: false,
+      error: "Unable to read the host ledger.",
+    });
+  }
+});
+
+app.get("/api/tickets/admin/host-settlements", requireTicketAdmin, (req, res) => {
+
+  try {
+    const hostId = normalizeLedgerHostId(req.query?.hostId);
+    const settlementData = readHostSettlements();
+    const settlements = hostId
+      ? settlementData.settlements.filter(
+          (settlement) => settlement?.hostId === hostId
+        )
+      : settlementData.settlements;
+
+    return res.json({
+      ok: true,
+      hostId: hostId || null,
+      settlementCount: settlements.length,
+      settlements,
+    });
+  } catch (error) {
+    console.error("HOST SETTLEMENT READ ERROR:", error);
+    return res.status(500).json({
+      ok: false,
+      error: "Unable to read host settlements.",
+    });
+  }
 });
 app.post("/api/tickets/reset", requireTicketAdmin, async (req, res) => {
   await resetTicketsPersisted();
