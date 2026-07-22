@@ -11,6 +11,7 @@ const app = express();
 const PORT = Number(process.env.PORT || process.env.TICKET_SERVER_PORT || 8790);
 const DATA_FILE = path.join(__dirname, "agv-tickets.json");
 const CHECKOUTS_FILE = path.join(__dirname, "agv-ticket-checkouts.json");
+const HOST_LEDGER_FILE = path.join(__dirname, "agv-host-balance-ledger.json"); // LC2-02B_HOST_BALANCE_LEDGER_ENGINE
 const STRIPE_SECRET_KEY = process.env.STRIPE_SECRET_KEY || "";
 const stripe = STRIPE_SECRET_KEY ? Stripe(STRIPE_SECRET_KEY) : null;
 const SUPABASE_URL = String(process.env.SUPABASE_URL || "").trim(); // PASS_LIVE_TICKET_PERSISTENCE_1A
@@ -37,6 +38,11 @@ const ADMIN_PIN = String(
     process.env.ADMIN_PIN ||
     DEFAULT_ADMIN_PIN
 ).trim();
+const EVENT_API_BASE = String(
+  process.env.AGV_EVENT_API_BASE ||
+    process.env.EVENT_API_BASE ||
+    "http://127.0.0.1:8786"
+).replace(/\/+$/, "");
 const APP_BASE_URL = String(
   process.env.AGV_APP_BASE_URL ||
     process.env.CLIENT_URL ||
@@ -77,8 +83,221 @@ function readCheckouts() {
   const parsed = readJsonFile(CHECKOUTS_FILE, { checkouts: [] });
   return Array.isArray(parsed.checkouts) ? parsed.checkouts : [];
 }
+async function resolveEventOwner(eventId) {
+  const cleanEventId = cleanText(eventId || "");
+  if (!cleanEventId) {
+    return { ok: false, ownerId: "", error: "Event ID is required." };
+  }
+
+  try {
+    const response = await fetch(
+      `${EVENT_API_BASE}/api/events/${encodeURIComponent(cleanEventId)}`
+    );
+
+    const data = await response.json().catch(() => ({}));
+
+    if (!response.ok || !data) {
+      return {
+        ok: false,
+        ownerId: "",
+        error: data?.error || data?.message || "Event could not be resolved.",
+      };
+    }
+
+    const event = data?.event || data;
+    const ownerId = cleanText(event?.ownerId || event?.owner_id || "");
+
+    if (!ownerId) {
+      return {
+        ok: false,
+        ownerId: "",
+        error: "Resolved event does not contain an owner ID.",
+      };
+    }
+
+    return {
+      ok: true,
+      ownerId,
+      event,
+    };
+  } catch (error) {
+    return {
+      ok: false,
+      ownerId: "",
+      error: error?.message || "Event ownership lookup failed.",
+    };
+  }
+}
+
 function writeCheckouts(checkouts) {
   writeJsonFile(CHECKOUTS_FILE, { checkouts });
+}
+
+// LC2-02B_HOST_BALANCE_LEDGER_ENGINE
+function emptyHostLedger() {
+  return {
+    version: 1,
+    updatedAt: new Date().toISOString(),
+    accounts: {},
+    entries: [],
+  };
+}
+
+function readHostLedger() {
+  const parsed = readJsonFile(HOST_LEDGER_FILE, emptyHostLedger());
+  return {
+    version: Number(parsed?.version || 1),
+    updatedAt: parsed?.updatedAt || new Date().toISOString(),
+    accounts:
+      parsed?.accounts && typeof parsed.accounts === "object"
+        ? parsed.accounts
+        : {},
+    entries: Array.isArray(parsed?.entries) ? parsed.entries : [],
+  };
+}
+
+function writeHostLedger(ledger) {
+  const normalized = {
+    version: 1,
+    updatedAt: new Date().toISOString(),
+    accounts:
+      ledger?.accounts && typeof ledger.accounts === "object"
+        ? ledger.accounts
+        : {},
+    entries: Array.isArray(ledger?.entries) ? ledger.entries : [],
+  };
+
+  const temporaryFile = `${HOST_LEDGER_FILE}.tmp`;
+  fs.writeFileSync(
+    temporaryFile,
+    JSON.stringify(normalized, null, 2),
+    "utf8"
+  );
+  fs.renameSync(temporaryFile, HOST_LEDGER_FILE);
+  return normalized;
+}
+
+function normalizeLedgerHostId(hostId) {
+  return String(hostId || "").trim().toLowerCase();
+}
+
+function getHostLedgerAccount(ledger, hostId) {
+  const normalizedHostId = normalizeLedgerHostId(hostId);
+  const current = ledger.accounts[normalizedHostId] || {};
+
+  return {
+    hostId: normalizedHostId,
+    pendingBalanceCents: Math.max(
+      0,
+      Math.round(Number(current.pendingBalanceCents || 0))
+    ),
+    availableBalanceCents: Math.max(
+      0,
+      Math.round(Number(current.availableBalanceCents || 0))
+    ),
+    lifetimeEarningsCents: Math.max(
+      0,
+      Math.round(Number(current.lifetimeEarningsCents || 0))
+    ),
+    lifetimePayoutsCents: Math.max(
+      0,
+      Math.round(Number(current.lifetimePayoutsCents || 0))
+    ),
+    lastLedgerEntryAt: current.lastLedgerEntryAt || null,
+    updatedAt: current.updatedAt || null,
+  };
+}
+
+function creditHostLedger({
+  hostId,
+  sourceType = "TICKET_SALE",
+  sourceId,
+  amountCents,
+  ticketCode = "",
+  checkoutId = "",
+  stripeCheckoutSessionId = "",
+  eventName = "",
+  roomId = "",
+}) {
+  const normalizedHostId = normalizeLedgerHostId(hostId);
+  const normalizedSourceType = String(sourceType || "TICKET_SALE")
+    .trim()
+    .toUpperCase();
+  const normalizedSourceId = String(sourceId || "").trim();
+  const safeAmountCents = Math.round(Number(amountCents || 0));
+
+  if (!normalizedHostId) {
+    throw new Error("Host ledger credit requires hostId.");
+  }
+
+  if (!normalizedSourceId) {
+    throw new Error("Host ledger credit requires sourceId.");
+  }
+
+  if (!Number.isFinite(safeAmountCents) || safeAmountCents <= 0) {
+    throw new Error("Host ledger credit amount must be greater than zero.");
+  }
+
+  const ledger = readHostLedger();
+  const idempotencyKey =
+    `CREDIT:${normalizedSourceType}:${normalizedSourceId}`;
+
+  const existingEntry = ledger.entries.find(
+    (entry) => entry?.idempotencyKey === idempotencyKey
+  );
+
+  if (existingEntry) {
+    return {
+      credited: false,
+      duplicate: true,
+      entry: existingEntry,
+      account: getHostLedgerAccount(ledger, normalizedHostId),
+    };
+  }
+
+  const now = new Date().toISOString();
+  const account = getHostLedgerAccount(ledger, normalizedHostId);
+
+  const entry = {
+    entryId: `hle_${crypto.randomBytes(12).toString("hex")}`,
+    idempotencyKey,
+    hostId: normalizedHostId,
+    entryType: "CREDIT",
+    balanceBucket: "PENDING",
+    sourceType: normalizedSourceType,
+    sourceId: normalizedSourceId,
+    amountCents: safeAmountCents,
+    ticketCode: String(ticketCode || "").trim().toUpperCase(),
+    checkoutId: String(checkoutId || "").trim(),
+    stripeCheckoutSessionId: String(
+      stripeCheckoutSessionId || ""
+    ).trim(),
+    eventName: String(eventName || "").trim(),
+    roomId: String(roomId || "").trim(),
+    status: "PENDING",
+    createdAt: now,
+  };
+
+  const updatedAccount = {
+    ...account,
+    pendingBalanceCents:
+      account.pendingBalanceCents + safeAmountCents,
+    lifetimeEarningsCents:
+      account.lifetimeEarningsCents + safeAmountCents,
+    lastLedgerEntryAt: now,
+    updatedAt: now,
+  };
+
+  ledger.accounts[normalizedHostId] = updatedAccount;
+  ledger.entries.unshift(entry);
+  writeHostLedger(ledger);
+
+  return {
+    credited: true,
+    duplicate: false,
+    entry,
+    account: updatedAccount,
+  };
 }
 // PASS_LIVE_TICKET_PERSISTENCE_1A - Supabase mirror + Supabase-first reads + JSON fallback.
 function ticketToSupabaseRow(ticket) {
@@ -421,6 +640,7 @@ app.post("/api/tickets/checkout", async (req, res) => {
     }
     const buyerName = cleanText(req.body?.buyerName || req.body?.name || "Guest");
     const buyerEmail = cleanEmail(req.body?.buyerEmail || req.body?.email || "");
+    const eventId = cleanText(req.body?.eventId || req.body?.event_id || "");
     const eventName = cleanText(req.body?.eventName || req.body?.event || "AGV Live Event");
     const roomId = normalizeRoomId(req.body?.roomId || req.body?.room || "main-hall");
     const amountCents =
@@ -430,6 +650,12 @@ app.post("/api/tickets/checkout", async (req, res) => {
       return res.status(400).json({
         ok: false,
         error: "Buyer name and buyer email are required.",
+      });
+    }
+    if (!eventId) {
+      return res.status(400).json({
+        ok: false,
+        error: "Event ID is required before ticket checkout can be created.",
       });
     }
     if (amountCents < 50) {
@@ -455,6 +681,7 @@ app.post("/api/tickets/checkout", async (req, res) => {
         checkoutId,
         buyerName,
         buyerEmail,
+        eventId,
         eventName,
         roomId,
         amountCents: String(amountCents),
@@ -471,6 +698,7 @@ app.post("/api/tickets/checkout", async (req, res) => {
               metadata: {
                 checkoutId,
                 roomId,
+                eventId,
                 eventName,
               },
             },
@@ -486,6 +714,7 @@ app.post("/api/tickets/checkout", async (req, res) => {
       paymentStatus: session.payment_status || "unpaid",
       buyerName,
       buyerEmail,
+      eventId,
       eventName,
       roomId,
       amountCents,
@@ -575,6 +804,7 @@ app.post("/api/tickets/confirm-checkout", async (req, res) => {
     }
     const buyerName = checkoutRecord.buyerName || session.metadata?.buyerName || "Guest";
     const buyerEmail = cleanEmail(checkoutRecord.buyerEmail || session.customer_details?.email || session.customer_email || "");
+    const eventId = cleanText(checkoutRecord.eventId || session.metadata?.eventId || "");
     const eventName = checkoutRecord.eventName || session.metadata?.eventName || "AGV Live Event";
     const roomId = normalizeRoomId(checkoutRecord.roomId || session.metadata?.roomId || "main-hall");
     if (!buyerEmail) {
@@ -586,10 +816,26 @@ app.post("/api/tickets/confirm-checkout", async (req, res) => {
     const paymentProcessingFeeCents = estimateStripeProcessingFeeCents(paidAmount);
     const broadcastDeliveryFeeCents = Math.max(0, Math.round(Number(req.body?.broadcastDeliveryFeeCents || 0)));
     const revenue = calculateRevenue(paidAmount, broadcastDeliveryFeeCents, paymentProcessingFeeCents);
+    if (!eventId) {
+      return res.status(409).json({
+        ok: false,
+        error: "Paid checkout is missing its event ID. No ticket or host credit was issued.",
+      });
+    }
+    const eventOwnerResolution = await resolveEventOwner(eventId);
+    if (!eventOwnerResolution.ok) {
+      return res.status(409).json({
+        ok: false,
+        error: `Event ownership verification failed: ${eventOwnerResolution.error}`,
+      });
+    }
+    const ownerId = eventOwnerResolution.ownerId;
     const ticket = {
       code: makeTicketCode(),
       buyerName,
       buyerEmail,
+      eventId,
+      ownerId,
       eventName,
       roomId,
       used: false,
@@ -606,9 +852,42 @@ app.post("/api/tickets/confirm-checkout", async (req, res) => {
       revenue,
       createdAt: new Date().toISOString(),
     };
+    const hostLedgerResult =
+      revenue.hostVendorNetRevenueCents > 0
+        ? creditHostLedger({
+            hostId: ownerId,
+            sourceType: "TICKET_SALE",
+            sourceId: session.id,
+            amountCents: revenue.hostVendorNetRevenueCents,
+            ticketCode: ticket.code,
+            checkoutId: checkoutRecord.checkoutId || "",
+            stripeCheckoutSessionId: session.id,
+            eventName,
+            roomId,
+          })
+        : {
+            credited: false,
+            duplicate: false,
+            skipped: true,
+            reason: "HOST_NET_ZERO",
+          };
+
+    ticket.hostLedger = {
+      credited: Boolean(hostLedgerResult.credited),
+      duplicate: Boolean(hostLedgerResult.duplicate),
+      skipped: Boolean(hostLedgerResult.skipped),
+      entryId: hostLedgerResult.entry?.entryId || "",
+      hostId: ownerId,
+      amountCents: revenue.hostVendorNetRevenueCents,
+      balanceBucket: hostLedgerResult.entry?.balanceBucket || "",
+      status: hostLedgerResult.entry?.status || "",
+    };
+
     const tickets = await readTicketsPersisted();
     tickets.unshift(ticket);
     await writeTicketsPersisted(tickets);
+    checkoutRecord.ownerId = ownerId;
+    checkoutRecord.hostLedger = ticket.hostLedger;
     checkoutRecord.status = "PAID_TICKET_ISSUED";
     checkoutRecord.paymentStatus = "paid";
     checkoutRecord.ticketIssued = true;
