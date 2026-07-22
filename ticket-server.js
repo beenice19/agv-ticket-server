@@ -292,6 +292,9 @@ function creditHostLedger({
   ledger.accounts[normalizedHostId] = updatedAccount;
   ledger.entries.unshift(entry);
   writeHostLedger(ledger);
+  void mirrorHostLedgerToSupabase(ledger).catch((error) => {
+    console.error("HOST LEDGER SUPABASE MIRROR ERROR:", error.message);
+  });
 
   return {
     credited: true,
@@ -352,6 +355,9 @@ function commitHostSettlementState(ledger, settlementData) {
   try {
     writeHostLedger(ledger);
     writeHostSettlements(settlementData);
+    void mirrorHostSettlementStateToSupabase(ledger, settlementData).catch((error) => {
+      console.error("HOST SETTLEMENT SUPABASE MIRROR ERROR:", error.message);
+    });
   } catch (error) {
     try {
       if (ledgerExisted) {
@@ -700,6 +706,347 @@ async function writeCheckoutsPersisted(checkouts) {
   if (error) {
     console.warn("AGV TICKET SUPABASE WRITE CHECKOUTS FAILED:", error.message);
   }
+}
+function hostLedgerAccountToSupabaseRow(account) {
+  const hostId = normalizeLedgerHostId(account?.hostId);
+
+  return {
+    record_id: `account:${hostId}`,
+    record_type: "ACCOUNT",
+    host_id: hostId,
+    idempotency_key: null,
+    entry_type: null,
+    balance_bucket: null,
+    source_type: null,
+    source_id: null,
+    amount_cents: null,
+    status: "ACTIVE",
+    settlement_id: null,
+    payload: account || {},
+    created_at:
+      account?.createdAt ||
+      account?.updatedAt ||
+      new Date().toISOString(),
+    updated_at:
+      account?.updatedAt ||
+      account?.lastLedgerEntryAt ||
+      new Date().toISOString(),
+  };
+}
+
+function hostLedgerEntryToSupabaseRow(entry) {
+  return {
+    record_id: String(entry?.entryId || "").trim(),
+    record_type: "ENTRY",
+    host_id: normalizeLedgerHostId(entry?.hostId),
+    idempotency_key:
+      String(entry?.idempotencyKey || "").trim() || null,
+    entry_type: String(entry?.entryType || "").trim() || null,
+    balance_bucket:
+      String(entry?.balanceBucket || "").trim() || null,
+    source_type: String(entry?.sourceType || "").trim() || null,
+    source_id: String(entry?.sourceId || "").trim() || null,
+    amount_cents: Number.isFinite(Number(entry?.amountCents))
+      ? Math.round(Number(entry.amountCents))
+      : null,
+    status: String(entry?.status || "").trim() || null,
+    settlement_id:
+      String(entry?.settlementId || "").trim() || null,
+    payload: entry || {},
+    created_at: entry?.createdAt || new Date().toISOString(),
+    updated_at:
+      entry?.updatedAt ||
+      entry?.createdAt ||
+      new Date().toISOString(),
+  };
+}
+
+function hostSettlementToSupabaseRow(settlement) {
+  return {
+    settlement_id:
+      String(settlement?.settlementId || "").trim(),
+    idempotency_key:
+      String(settlement?.idempotencyKey || "").trim(),
+    host_id: normalizeLedgerHostId(settlement?.hostId),
+    settlement_type:
+      String(settlement?.settlementType || "").trim(),
+    settlement_method:
+      String(settlement?.settlementMethod || "").trim() || null,
+    amount_cents: Math.round(
+      Number(settlement?.amountCents || 0)
+    ),
+    source_id: String(settlement?.sourceId || "").trim(),
+    external_reference:
+      String(settlement?.externalReference || "").trim() || null,
+    status: String(settlement?.status || "").trim(),
+    note: String(settlement?.note || "").trim() || null,
+    payload: settlement || {},
+    created_at:
+      settlement?.createdAt || new Date().toISOString(),
+    completed_at: settlement?.completedAt || null,
+    paid_at: settlement?.paidAt || null,
+    updated_at:
+      settlement?.updatedAt ||
+      settlement?.completedAt ||
+      settlement?.paidAt ||
+      settlement?.createdAt ||
+      new Date().toISOString(),
+  };
+}
+
+async function readHostLedgerPersisted() {
+  const jsonLedger = readHostLedger();
+
+  if (!supabase) {
+    return jsonLedger;
+  }
+
+  try {
+    const { data, error } = await supabase
+      .from("agv_host_balance_ledger")
+      .select("record_type,host_id,payload")
+      .order("created_at", { ascending: false });
+
+    if (error) {
+      console.warn(
+        "AGV HOST LEDGER SUPABASE READ FALLBACK:",
+        error.message
+      );
+      return jsonLedger;
+    }
+
+    if (!Array.isArray(data) || !data.length) {
+      return jsonLedger;
+    }
+
+    const accounts = {};
+    const entries = [];
+
+    for (const row of data) {
+      if (row?.record_type === "ACCOUNT") {
+        const account = row.payload || {};
+        const hostId = normalizeLedgerHostId(
+          account.hostId || row.host_id
+        );
+
+        if (hostId) {
+          accounts[hostId] = {
+            ...account,
+            hostId,
+          };
+        }
+      } else if (row?.record_type === "ENTRY" && row.payload) {
+        entries.push(row.payload);
+      }
+    }
+
+    return {
+      version: 1,
+      updatedAt: new Date().toISOString(),
+      accounts,
+      entries,
+    };
+  } catch (error) {
+    console.warn(
+      "AGV HOST LEDGER SUPABASE READ ERROR:",
+      error.message
+    );
+    return jsonLedger;
+  }
+}
+
+async function writeHostLedgerPersisted(ledger) {
+  const normalized = writeHostLedger(ledger);
+
+  if (!supabase) {
+    return normalized;
+  }
+
+  const accountRows = Object.values(normalized.accounts || {})
+    .filter((account) => account && account.hostId)
+    .map(hostLedgerAccountToSupabaseRow);
+
+  const entryRows = normalized.entries
+    .filter((entry) => entry && entry.entryId && entry.hostId)
+    .map(hostLedgerEntryToSupabaseRow);
+
+  const rows = [...accountRows, ...entryRows];
+
+  if (!rows.length) {
+    return normalized;
+  }
+
+  const { error } = await supabase
+    .from("agv_host_balance_ledger")
+    .upsert(rows, { onConflict: "record_id" });
+
+  if (error) {
+    console.warn(
+      "AGV HOST LEDGER SUPABASE WRITE FAILED:",
+      error.message
+    );
+  }
+
+  return normalized;
+}
+
+async function readHostSettlementsPersisted() {
+  const jsonSettlements = readHostSettlements();
+
+  if (!supabase) {
+    return jsonSettlements;
+  }
+
+  try {
+    const { data, error } = await supabase
+      .from("agv_host_settlements")
+      .select("payload")
+      .order("created_at", { ascending: false });
+
+    if (error) {
+      console.warn(
+        "AGV HOST SETTLEMENT SUPABASE READ FALLBACK:",
+        error.message
+      );
+      return jsonSettlements;
+    }
+
+    const settlements = Array.isArray(data)
+      ? data.map((row) => row.payload).filter(Boolean)
+      : [];
+
+    return settlements.length
+      ? {
+          version: 1,
+          updatedAt: new Date().toISOString(),
+          settlements,
+        }
+      : jsonSettlements;
+  } catch (error) {
+    console.warn(
+      "AGV HOST SETTLEMENT SUPABASE READ ERROR:",
+      error.message
+    );
+    return jsonSettlements;
+  }
+}
+
+async function writeHostSettlementsPersisted(data) {
+  const normalized = writeHostSettlements(data);
+
+  if (!supabase) {
+    return normalized;
+  }
+
+  const rows = normalized.settlements
+    .filter(
+      (settlement) =>
+        settlement &&
+        settlement.settlementId &&
+        settlement.idempotencyKey &&
+        settlement.hostId
+    )
+    .map(hostSettlementToSupabaseRow);
+
+  if (!rows.length) {
+    return normalized;
+  }
+
+  const { error } = await supabase
+    .from("agv_host_settlements")
+    .upsert(rows, { onConflict: "settlement_id" });
+
+  if (error) {
+    console.warn(
+      "AGV HOST SETTLEMENT SUPABASE WRITE FAILED:",
+      error.message
+    );
+  }
+
+  return normalized;
+}
+async function mirrorHostLedgerToSupabase(ledger) {
+  if (!supabase) {
+    return { mirrored: false, reason: "SUPABASE_NOT_CONFIGURED" };
+  }
+
+  const accountRows = Object.values(ledger?.accounts || {})
+    .filter((account) => account && account.hostId)
+    .map(hostLedgerAccountToSupabaseRow);
+
+  const entryRows = Array.isArray(ledger?.entries)
+    ? ledger.entries
+        .filter((entry) => entry && entry.entryId && entry.hostId)
+        .map(hostLedgerEntryToSupabaseRow)
+    : [];
+
+  const rows = [...accountRows, ...entryRows];
+
+  if (!rows.length) {
+    return { mirrored: true, rowCount: 0 };
+  }
+
+  const { error } = await supabase
+    .from("agv_host_balance_ledger")
+    .upsert(rows, { onConflict: "record_id" });
+
+  if (error) {
+    throw new Error(`Host ledger Supabase mirror failed: ${error.message}`);
+  }
+
+  return { mirrored: true, rowCount: rows.length };
+}
+
+async function mirrorHostSettlementsToSupabase(settlementData) {
+  if (!supabase) {
+    return { mirrored: false, reason: "SUPABASE_NOT_CONFIGURED" };
+  }
+
+  const settlements = Array.isArray(settlementData?.settlements)
+    ? settlementData.settlements
+    : [];
+
+  const rows = settlements
+    .filter(
+      (settlement) =>
+        settlement &&
+        settlement.settlementId &&
+        settlement.idempotencyKey &&
+        settlement.hostId
+    )
+    .map(hostSettlementToSupabaseRow);
+
+  if (!rows.length) {
+    return { mirrored: true, rowCount: 0 };
+  }
+
+  const { error } = await supabase
+    .from("agv_host_settlements")
+    .upsert(rows, { onConflict: "settlement_id" });
+
+  if (error) {
+    throw new Error(
+      `Host settlement Supabase mirror failed: ${error.message}`
+    );
+  }
+
+  return { mirrored: true, rowCount: rows.length };
+}
+
+async function mirrorHostSettlementStateToSupabase(
+  ledger,
+  settlementData
+) {
+  const [ledgerResult, settlementResult] = await Promise.all([
+    mirrorHostLedgerToSupabase(ledger),
+    mirrorHostSettlementsToSupabase(settlementData),
+  ]);
+
+  return {
+    mirrored: true,
+    ledger: ledgerResult,
+    settlements: settlementResult,
+  };
 }
 async function findTicketByCheckoutSessionIdPersisted(sessionId) {
   const tickets = await readTicketsPersisted();
@@ -1234,11 +1581,11 @@ app.post("/api/tickets/verify", async (req, res) => {
     message: "Ticket approved.",
   });
 });
-app.get("/api/tickets/admin/host-ledger", requireTicketAdmin, (req, res) => {
+app.get("/api/tickets/admin/host-ledger", requireTicketAdmin, async (req, res) => {
 
   try {
     const hostId = normalizeLedgerHostId(req.query?.hostId);
-    const ledger = readHostLedger();
+    const ledger = await readHostLedgerPersisted();
 
     if (hostId) {
       return res.json({
@@ -1266,11 +1613,11 @@ app.get("/api/tickets/admin/host-ledger", requireTicketAdmin, (req, res) => {
   }
 });
 
-app.get("/api/tickets/admin/host-settlements", requireTicketAdmin, (req, res) => {
+app.get("/api/tickets/admin/host-settlements", requireTicketAdmin, async (req, res) => {
 
   try {
     const hostId = normalizeLedgerHostId(req.query?.hostId);
-    const settlementData = readHostSettlements();
+    const settlementData = await readHostSettlementsPersisted();
     const settlements = hostId
       ? settlementData.settlements.filter(
           (settlement) => settlement?.hostId === hostId

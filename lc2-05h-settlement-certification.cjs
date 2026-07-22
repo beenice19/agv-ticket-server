@@ -19,6 +19,10 @@ const settlementsFile = path.join(
 process.env.AGV_HOST_LEDGER_FILE = ledgerFile;
 process.env.AGV_HOST_SETTLEMENTS_FILE = settlementsFile;
 
+// Keep certification activity fully isolated from live Supabase.
+process.env.SUPABASE_URL = "";
+process.env.SUPABASE_SERVICE_ROLE_KEY = "";
+
 const {
   creditHostLedger,
   releasePendingHostFunds,
