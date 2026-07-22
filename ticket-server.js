@@ -11,8 +11,8 @@ const app = express();
 const PORT = Number(process.env.TICKET_SERVER_PORT || process.env.PORT || 8797);
 const DATA_FILE = path.join(__dirname, "agv-tickets.json");
 const CHECKOUTS_FILE = path.join(__dirname, "agv-ticket-checkouts.json");
-const HOST_LEDGER_FILE = path.join(__dirname, "agv-host-balance-ledger.json"); // LC2-02B_HOST_BALANCE_LEDGER_ENGINE
-const HOST_SETTLEMENTS_FILE = path.join(__dirname, "agv-host-settlements.json"); // LC2-04D_HOST_SETTLEMENT_ENGINE
+const HOST_LEDGER_FILE = process.env.AGV_HOST_LEDGER_FILE || path.join(__dirname, "agv-host-balance-ledger.json"); // LC2-02B_HOST_BALANCE_LEDGER_ENGINE
+const HOST_SETTLEMENTS_FILE = process.env.AGV_HOST_SETTLEMENTS_FILE || path.join(__dirname, "agv-host-settlements.json"); // LC2-04D_HOST_SETTLEMENT_ENGINE
 const STRIPE_SECRET_KEY = process.env.STRIPE_SECRET_KEY || "";
 const stripe = STRIPE_SECRET_KEY ? Stripe(STRIPE_SECRET_KEY) : null;
 const SUPABASE_URL = String(process.env.SUPABASE_URL || "").trim(); // PASS_LIVE_TICKET_PERSISTENCE_1A
@@ -1308,13 +1308,23 @@ app.use((req, res) => {
     path: req.path,
   });
 });
-app.listen(PORT, () => {
-  console.log("AGV TICKET SERVER RUNNING ON", PORT);
-  console.log("PASS:", "AGV_REVENUE_LOCK_1B");
-  console.log("DATA FILE:", DATA_FILE);
-  console.log("CHECKOUTS FILE:", CHECKOUTS_FILE);
-  console.log("STRIPE CONFIGURED:", Boolean(stripe));
-  console.log("APP BASE URL:", APP_BASE_URL);
-  console.log("ADMIN PIN CONFIGURED:", Boolean(ADMIN_PIN));
-  console.log("ADMIN PIN LENGTH:", ADMIN_PIN.length);
-});
+if (require.main === module) {
+  app.listen(PORT, () => {
+    console.log("AGV TICKET SERVER RUNNING ON", PORT);
+    console.log("PASS:", "AGV_REVENUE_LOCK_1B");
+    console.log("DATA FILE:", DATA_FILE);
+    console.log("CHECKOUTS FILE:", CHECKOUTS_FILE);
+    console.log("STRIPE CONFIGURED:", Boolean(stripe));
+    console.log("APP BASE URL:", APP_BASE_URL);
+    console.log("ADMIN PIN CONFIGURED:", Boolean(ADMIN_PIN));
+    console.log("ADMIN PIN LENGTH:", ADMIN_PIN.length);
+  });
+}
+
+module.exports = {
+  creditHostLedger,
+  releasePendingHostFunds,
+  recordHostPayout,
+  readHostLedger,
+  readHostSettlements,
+};
