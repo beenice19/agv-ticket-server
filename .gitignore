@@ -23,3 +23,5 @@ create-stripe-internal-test-price.js
 .env.*
 agv-tickets.json
 _old-pass-files/
+
+runtime-certifications/
