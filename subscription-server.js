@@ -455,6 +455,40 @@ function normalizeNetworkStation(station = {}, index = 0) {
     healthStatus: cleanText(
       station.healthStatus || "UNKNOWN"
     ),
+
+    // PASS CCH-04C — SPONSORSHIP PERSISTENCE
+    sponsorEnabled: station.sponsorEnabled === true,
+    sponsorName: cleanText(
+      station.sponsorName || ""
+    ),
+    sponsorDisclosure: cleanText(
+      station.sponsorDisclosure || ""
+    ),
+    campaignStart: cleanText(
+      station.campaignStart || ""
+    ),
+    campaignEnd: cleanText(
+      station.campaignEnd || ""
+    ),
+    sponsorArtwork: cleanText(
+      station.sponsorArtwork || ""
+    ),
+    sponsorClickUrl: cleanText(
+      station.sponsorClickUrl || ""
+    ),
+    sponsoredProgram:
+      station.sponsoredProgram === true,
+    impressions: Math.max(
+      0,
+      Number.parseInt(station.impressions, 10) || 0
+    ),
+    sponsorWatchMinutes: Math.max(
+      0,
+      Number.parseInt(
+        station.sponsorWatchMinutes,
+        10
+      ) || 0
+    ),
   };
 }
 
@@ -491,6 +525,157 @@ function normalizeNetworkStations(value) {
       seen.add(station.id);
       return true;
     });
+}
+
+// PASS CCH-04C — SERVER SPONSORSHIP VALIDATION
+function isValidHttpsUrl(value) {
+  const raw = cleanText(value || "");
+
+  if (!raw) {
+    return false;
+  }
+
+  try {
+    const parsed = new URL(raw);
+    return parsed.protocol === "https:";
+  } catch {
+    return false;
+  }
+}
+
+function validateNetworkStationSponsorship(station, index) {
+  const item =
+    station && typeof station === "object"
+      ? station
+      : {};
+
+  const label =
+    cleanText(item.title || item.id || "") ||
+    `Station ${index + 1}`;
+
+  const errors = [];
+
+  const sponsorEnabled =
+    item.sponsorEnabled === true;
+
+  const impressions = Number(
+    item.impressions ?? 0
+  );
+
+  const sponsorWatchMinutes = Number(
+    item.sponsorWatchMinutes ?? 0
+  );
+
+  if (
+    !Number.isFinite(impressions) ||
+    impressions < 0
+  ) {
+    errors.push(
+      `${label}: impressions must be a nonnegative number.`
+    );
+  }
+
+  if (
+    !Number.isFinite(sponsorWatchMinutes) ||
+    sponsorWatchMinutes < 0
+  ) {
+    errors.push(
+      `${label}: sponsor watch minutes must be a nonnegative number.`
+    );
+  }
+
+  if (!sponsorEnabled) {
+    return errors;
+  }
+
+  const sponsorName = cleanText(
+    item.sponsorName || ""
+  );
+
+  const sponsorDisclosure = cleanText(
+    item.sponsorDisclosure || ""
+  );
+
+  const campaignStart = cleanText(
+    item.campaignStart || ""
+  );
+
+  const campaignEnd = cleanText(
+    item.campaignEnd || ""
+  );
+
+  const sponsorArtwork = cleanText(
+    item.sponsorArtwork || ""
+  );
+
+  const sponsorClickUrl = cleanText(
+    item.sponsorClickUrl || ""
+  );
+
+  if (!sponsorName) {
+    errors.push(
+      `${label}: sponsor name is required when sponsorship is enabled.`
+    );
+  }
+
+  if (!sponsorDisclosure) {
+    errors.push(
+      `${label}: sponsor disclosure is required when sponsorship is enabled.`
+    );
+  }
+
+  if (!campaignStart) {
+    errors.push(
+      `${label}: campaign start is required when sponsorship is enabled.`
+    );
+  }
+
+  if (!campaignEnd) {
+    errors.push(
+      `${label}: campaign end is required when sponsorship is enabled.`
+    );
+  }
+
+  if (campaignStart && campaignEnd) {
+    const startTime =
+      new Date(campaignStart).getTime();
+
+    const endTime =
+      new Date(campaignEnd).getTime();
+
+    if (
+      !Number.isFinite(startTime) ||
+      !Number.isFinite(endTime)
+    ) {
+      errors.push(
+        `${label}: campaign dates must be valid.`
+      );
+    } else if (endTime <= startTime) {
+      errors.push(
+        `${label}: campaign end must be later than campaign start.`
+      );
+    }
+  }
+
+  if (
+    sponsorArtwork &&
+    !isValidHttpsUrl(sponsorArtwork)
+  ) {
+    errors.push(
+      `${label}: sponsor artwork must use a valid HTTPS URL.`
+    );
+  }
+
+  if (
+    sponsorClickUrl &&
+    !isValidHttpsUrl(sponsorClickUrl)
+  ) {
+    errors.push(
+      `${label}: sponsor click-through destination must use a valid HTTPS URL.`
+    );
+  }
+
+  return errors;
 }
 
 function defaultData() {
@@ -1130,6 +1315,24 @@ app.put(
       return res.status(400).json({
         ok: false,
         error: "A stations array is required.",
+      });
+    }
+
+    const sponsorshipErrors =
+      req.body.stations.flatMap(
+        (station, index) =>
+          validateNetworkStationSponsorship(
+            station,
+            index
+          )
+      );
+
+    if (sponsorshipErrors.length) {
+      return res.status(400).json({
+        ok: false,
+        error:
+          "AGV Network sponsorship validation failed.",
+        errors: sponsorshipErrors,
       });
     }
 
