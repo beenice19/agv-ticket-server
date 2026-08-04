@@ -32,6 +32,9 @@ const DATA_FILE = path.join(__dirname, "stro-cheivery-data.json");
 const USERS_FILE = path.join(__dirname, "stro-cheivery-users.json");
 const MEDIA_INTAKE_FILE = path.join(__dirname, "stro-cheivery-media-intake.json");
 
+// PASS PROD-OD-01 — HOSTED PUBLIC MEDIA SNAPSHOT
+const PUBLIC_MEDIA_CATALOG_FILE = path.join(__dirname, "stro-cheivery-public-media-catalog.json");
+
 // PASS CP-03 CONTENT PARTNER SUBMISSION DRAFT REGISTRY
 const CONTENT_PARTNER_SUBMISSIONS_FILE = path.join(
   __dirname,
@@ -5753,6 +5756,47 @@ function isControlledExternalLinkPubliclyActive(
         ?.emergencyBlocked !== true
   );
 }
+
+// PASS PROD-OD-01 — PRODUCTION PUBLIC ON DEMAND CATALOG
+// Hosted Render instances use a committed snapshot containing only
+// records already approved by the existing public media API.
+app.get("/api/media/public", (req, res, next) => {
+  const hostedProduction =
+    String(process.env.RENDER || "").toLowerCase() === "true" ||
+    String(process.env.NODE_ENV || "").toLowerCase() === "production";
+
+  if (
+    !hostedProduction ||
+    !fs.existsSync(PUBLIC_MEDIA_CATALOG_FILE)
+  ) {
+    return next();
+  }
+
+  try {
+    const snapshot = JSON.parse(
+      fs.readFileSync(PUBLIC_MEDIA_CATALOG_FILE, "utf8")
+    );
+
+    const items = Array.isArray(snapshot?.items)
+      ? snapshot.items
+      : [];
+
+    return res.json({
+      ok: true,
+      count: items.length,
+      items,
+      source: "PRODUCTION_PUBLIC_MEDIA_SNAPSHOT",
+      generatedAt: snapshot?.generatedAt || null,
+    });
+  } catch (error) {
+    console.error(
+      "PRODUCTION PUBLIC MEDIA SNAPSHOT FAILED:",
+      error.message
+    );
+
+    return next();
+  }
+});
 
 app.get(
   "/api/media/public",
