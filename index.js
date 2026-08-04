@@ -9,9 +9,21 @@ const jwt = require("jsonwebtoken");
 const multer = require("multer");
 const crypto = require("crypto");
 const { Server } = require("socket.io");
+const {
+  loadMediaRegistrySnapshot,
+  queueMediaRegistrySnapshot,
+  getMediaRegistryAdapterStatus,
+} = require("./agv-media-registry-supabase.cjs");
 
 const app = express();
 const PORT = Number(process.env.PORT || 8787); // PASS_LIVE_SERVICE_DEPLOY_MAP_1_RENDER_PORT
+
+const AGV_MEDIA_REGISTRY_MODE = String(
+  process.env.AGV_MEDIA_REGISTRY_MODE || "file"
+).trim().toLowerCase();
+
+const AGV_MEDIA_REGISTRY_SUPABASE_ENABLED =
+  AGV_MEDIA_REGISTRY_MODE === "supabase";
 
 app.use(cors());
 app.use(express.json({ limit: "8mb" }));
@@ -1161,6 +1173,17 @@ function saveMediaIntakes(mediaIntakes) {
     JSON.stringify(mediaIntakes, null, 2),
     "utf8"
   );
+
+  if (AGV_MEDIA_REGISTRY_SUPABASE_ENABLED) {
+    queueMediaRegistrySnapshot(mediaIntakes).catch(
+      (error) => {
+        console.error(
+          "MEDIA REGISTRY SUPABASE SAVE FAILED:",
+          error.message
+        );
+      }
+    );
+  }
 }
 
 // PASS CU-07D — CONTROLLED MEDIA INTAKE HELPERS
@@ -8046,18 +8069,102 @@ app.get("/api/media/upload-readiness", (req, res) => {
   });
 });
 
-server.listen(PORT, () => {
-  const usersFileExists = fs.existsSync(USERS_FILE);
-
-  console.log(`SERVER RUNNING ON ${PORT}`);
-  console.log(`DATA FILE: ${DATA_FILE}`);
-  console.log(`USERS FILE: ${USERS_FILE}`);
-
-  if (!usersFileExists) {
-    console.log("DEFAULT ADMIN USERNAME:", DEFAULT_ADMIN_USERNAME);
-    console.log(
-      "DEFAULT ADMIN PASSWORD is loaded from AGV_ADMIN_PASSWORD or the fallback in index.js."
-    );
-    console.log("Change the seeded admin password before exposing this server.");
+async function prepareMediaRegistryBeforeListen() {
+  if (!AGV_MEDIA_REGISTRY_SUPABASE_ENABLED) {
+    return {
+      mode: "file",
+      loaded: false,
+      recordCount: loadMediaIntakes().length,
+      founderDecisionCount: 0,
+    };
   }
+
+  const adapterStatus =
+    getMediaRegistryAdapterStatus();
+
+  if (!adapterStatus.configured) {
+    throw new Error(
+      "Supabase media registry mode is enabled but its backend configuration is unavailable."
+    );
+  }
+
+  const snapshot =
+    await loadMediaRegistrySnapshot();
+
+  if (!snapshot.found) {
+    throw new Error(
+      "The durable Supabase media registry snapshot was not found."
+    );
+  }
+
+  const intakeIds = snapshot.records
+    .map((entry) =>
+      String(entry?.intakeId || "").trim()
+    )
+    .filter(Boolean);
+
+  if (
+    intakeIds.length !== snapshot.recordCount ||
+    new Set(intakeIds).size !== snapshot.recordCount
+  ) {
+    throw new Error(
+      "The durable Supabase media registry intake-ID verification failed."
+    );
+  }
+
+  fs.writeFileSync(
+    MEDIA_INTAKE_FILE,
+    JSON.stringify(snapshot.records, null, 2),
+    "utf8"
+  );
+
+  return {
+    mode: "supabase",
+    loaded: true,
+    recordCount: snapshot.recordCount,
+    founderDecisionCount:
+      snapshot.founderDecisionCount,
+  };
+}
+
+async function startAgvServer() {
+  const registryStartup =
+    await prepareMediaRegistryBeforeListen();
+
+  server.listen(PORT, () => {
+    const usersFileExists = fs.existsSync(USERS_FILE);
+
+    console.log(`SERVER RUNNING ON ${PORT}`);
+    console.log(`DATA FILE: ${DATA_FILE}`);
+    console.log(`USERS FILE: ${USERS_FILE}`);
+    console.log(
+      `MEDIA REGISTRY MODE: ${registryStartup.mode.toUpperCase()}`
+    );
+
+    if (registryStartup.loaded) {
+      console.log(
+        `MEDIA REGISTRY RECORDS: ${registryStartup.recordCount}`
+      );
+      console.log(
+        `FOUNDER DECISIONS: ${registryStartup.founderDecisionCount}`
+      );
+    }
+
+    if (!usersFileExists) {
+      console.log("DEFAULT ADMIN USERNAME:", DEFAULT_ADMIN_USERNAME);
+      console.log(
+        "DEFAULT ADMIN PASSWORD is loaded from AGV_ADMIN_PASSWORD or the fallback in index.js."
+      );
+      console.log("Change the seeded admin password before exposing this server.");
+    }
+  });
+}
+
+startAgvServer().catch((error) => {
+  console.error(
+    "AGV SERVER STARTUP FAILED:",
+    error.message
+  );
+
+  process.exit(1);
 });
