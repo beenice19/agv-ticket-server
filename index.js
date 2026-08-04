@@ -7980,6 +7980,72 @@ app.get("/api/tickets/:code", (req, res) => {
     },
   });
 });
+/*
+========================================================
+PASS PROD-UPLOAD-TIMEOUT-02 — LARGE MEDIA REQUEST WINDOW
+========================================================
+Allows controlled media uploads to remain open long enough
+for large MP4 files to reach the AGV server.
+*/
+
+const AGV_UPLOAD_REQUEST_TIMEOUT_MS = (() => {
+  const configured = Number(
+    process.env.AGV_UPLOAD_REQUEST_TIMEOUT_MS || 5400000
+  );
+
+  return Number.isFinite(configured) && configured >= 300000
+    ? configured
+    : 5400000;
+})();
+
+const AGV_UPLOAD_HEADERS_TIMEOUT_MS = (() => {
+  const configured = Number(
+    process.env.AGV_UPLOAD_HEADERS_TIMEOUT_MS || 120000
+  );
+
+  return Number.isFinite(configured) && configured >= 60000
+    ? configured
+    : 120000;
+})();
+
+const AGV_UPLOAD_KEEP_ALIVE_TIMEOUT_MS = (() => {
+  const configured = Number(
+    process.env.AGV_UPLOAD_KEEP_ALIVE_TIMEOUT_MS || 75000
+  );
+
+  return Number.isFinite(configured) && configured >= 5000
+    ? configured
+    : 75000;
+})();
+
+server.requestTimeout = AGV_UPLOAD_REQUEST_TIMEOUT_MS;
+
+server.headersTimeout = Math.min(
+  AGV_UPLOAD_HEADERS_TIMEOUT_MS,
+  AGV_UPLOAD_REQUEST_TIMEOUT_MS
+);
+
+server.keepAliveTimeout =
+  AGV_UPLOAD_KEEP_ALIVE_TIMEOUT_MS;
+
+server.setTimeout(
+  AGV_UPLOAD_REQUEST_TIMEOUT_MS
+);
+
+app.get("/api/media/upload-readiness", (req, res) => {
+  return res.json({
+    ok: true,
+    service: "AGV Controlled Media Upload",
+    maximumUploadBytes: CONTROLLED_MEDIA_MAX_BYTES,
+    requestTimeoutMs: AGV_UPLOAD_REQUEST_TIMEOUT_MS,
+    requestTimeoutMinutes: Math.round(
+      AGV_UPLOAD_REQUEST_TIMEOUT_MS / 60000
+    ),
+    headersTimeoutMs: AGV_UPLOAD_HEADERS_TIMEOUT_MS,
+    keepAliveTimeoutMs: AGV_UPLOAD_KEEP_ALIVE_TIMEOUT_MS,
+  });
+});
+
 server.listen(PORT, () => {
   const usersFileExists = fs.existsSync(USERS_FILE);
 
