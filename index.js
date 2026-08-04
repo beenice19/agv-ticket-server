@@ -5790,6 +5790,7 @@ app.get("/api/media/public", (req, res, next) => {
 
   if (
     !hostedProduction ||
+    AGV_MEDIA_REGISTRY_SUPABASE_ENABLED ||
     !fs.existsSync(PUBLIC_MEDIA_CATALOG_FILE)
   ) {
     return next();
