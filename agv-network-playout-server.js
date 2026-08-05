@@ -2895,6 +2895,643 @@ async function handleRequest(
       return;
     }
 
+    // PASS ANPE-02F1B — ADMIN INVOICE WORKFLOW ROUTES
+    // Administrative invoicing only. No payment processing or billing execution.
+    if (
+      req.method === "GET" &&
+      pathname ===
+        "/api/admin/commercial/invoices"
+    ) {
+      const data = readData();
+
+      const campaignId = cleanText(
+        url.searchParams.get("campaignId"),
+        160
+      );
+
+      const contractId = cleanText(
+        url.searchParams.get("contractId"),
+        160
+      );
+
+      const statusFilter = cleanText(
+        url.searchParams.get("status"),
+        60
+      ).toUpperCase();
+
+      const invoices =
+        data.invoices.filter(
+          (item) =>
+            (!campaignId ||
+              item.campaignId ===
+                campaignId) &&
+            (!contractId ||
+              item.contractId ===
+                contractId) &&
+            (!statusFilter ||
+              item.status ===
+                statusFilter)
+        );
+
+      sendJson(res, 200, {
+        ok: true,
+        invoices,
+        count: invoices.length,
+      });
+
+      return;
+    }
+
+    if (
+      req.method === "POST" &&
+      pathname ===
+        "/api/admin/commercial/invoices"
+    ) {
+      const body =
+        await readJsonBody(req);
+
+      const campaignId = cleanText(
+        body.campaignId,
+        160
+      );
+
+      const contractId = cleanText(
+        body.contractId,
+        160
+      );
+
+      if (!campaignId) {
+        sendJson(res, 400, {
+          ok: false,
+          error:
+            "A campaignId is required.",
+        });
+
+        return;
+      }
+
+      if (!contractId) {
+        sendJson(res, 400, {
+          ok: false,
+          error:
+            "A contractId is required.",
+        });
+
+        return;
+      }
+
+      const data = readData();
+
+      const campaign =
+        data.campaigns.find(
+          (item) =>
+            item.id === campaignId
+        );
+
+      if (!campaign) {
+        sendJson(res, 404, {
+          ok: false,
+          error:
+            "Campaign was not found.",
+        });
+
+        return;
+      }
+
+      const contract =
+        data.contracts.find(
+          (item) =>
+            item.id === contractId
+        );
+
+      if (!contract) {
+        sendJson(res, 404, {
+          ok: false,
+          error:
+            "Contract was not found.",
+        });
+
+        return;
+      }
+
+      if (
+        contract.campaignId !==
+        campaign.id
+      ) {
+        sendJson(res, 409, {
+          ok: false,
+          error:
+            "The contract does not belong to this campaign.",
+        });
+
+        return;
+      }
+
+      if (
+        contract.status !== "SIGNED" &&
+        contract.status !==
+          "ACTIVE"
+      ) {
+        sendJson(res, 409, {
+          ok: false,
+          error:
+            "The contract must be SIGNED or ACTIVE before an invoice can be created.",
+          contractStatus:
+            contract.status,
+        });
+
+        return;
+      }
+
+      const existingInvoice =
+        data.invoices.find(
+          (item) =>
+            item.campaignId ===
+              campaign.id &&
+            item.contractId ===
+              contract.id &&
+            item.status !== "VOID" &&
+            item.status !==
+              "REFUNDED"
+        );
+
+      if (existingInvoice) {
+        sendJson(res, 409, {
+          ok: false,
+          error:
+            "This campaign and contract already have an active invoice.",
+          invoice:
+            existingInvoice,
+        });
+
+        return;
+      }
+
+      const invoiceNumber =
+        cleanText(
+          body.invoiceNumber ||
+            `ANPE-${Date.now()}-${data.invoices.length + 1}`,
+          120
+        );
+
+      const duplicateNumber =
+        data.invoices.find(
+          (item) =>
+            item.invoiceNumber &&
+            item.invoiceNumber.toLowerCase() ===
+              invoiceNumber.toLowerCase()
+        );
+
+      if (duplicateNumber) {
+        sendJson(res, 409, {
+          ok: false,
+          error:
+            "The invoice number is already in use.",
+          invoice:
+            duplicateNumber,
+        });
+
+        return;
+      }
+
+      const subtotalSource =
+        body.subtotalCents ===
+        undefined
+          ? campaign.quotedAmountCents
+          : body.subtotalCents;
+
+      const subtotalCents =
+        Number(
+          subtotalSource || 0
+        );
+
+      const taxCents =
+        Number(
+          body.taxCents || 0
+        );
+
+      const calculatedTotal =
+        subtotalCents + taxCents;
+
+      const totalCents =
+        body.totalCents ===
+        undefined
+          ? calculatedTotal
+          : Number(
+              body.totalCents
+            );
+
+      if (
+        !Number.isSafeInteger(
+          subtotalCents
+        ) ||
+        !Number.isSafeInteger(
+          taxCents
+        ) ||
+        !Number.isSafeInteger(
+          totalCents
+        ) ||
+        subtotalCents < 0 ||
+        taxCents < 0 ||
+        totalCents < 0
+      ) {
+        sendJson(res, 400, {
+          ok: false,
+          error:
+            "Invoice amounts must be nonnegative whole cents.",
+        });
+
+        return;
+      }
+
+      if (
+        totalCents !==
+        calculatedTotal
+      ) {
+        sendJson(res, 400, {
+          ok: false,
+          error:
+            "Invoice totalCents must equal subtotalCents plus taxCents.",
+        });
+
+        return;
+      }
+
+      const requestedIssuedAt =
+        cleanText(
+          body.issuedAt,
+          80
+        );
+
+      const requestedDueAt =
+        cleanText(
+          body.dueAt,
+          80
+        );
+
+      const issuedAt =
+        nullableIso(
+          body.issuedAt
+        );
+
+      const dueAt =
+        nullableIso(
+          body.dueAt
+        );
+
+      if (
+        requestedIssuedAt &&
+        !issuedAt
+      ) {
+        sendJson(res, 400, {
+          ok: false,
+          error:
+            "issuedAt must contain a valid date and time.",
+        });
+
+        return;
+      }
+
+      if (
+        requestedDueAt &&
+        !dueAt
+      ) {
+        sendJson(res, 400, {
+          ok: false,
+          error:
+            "dueAt must contain a valid date and time.",
+        });
+
+        return;
+      }
+
+      if (
+        issuedAt &&
+        dueAt &&
+        Date.parse(dueAt) <
+          Date.parse(issuedAt)
+      ) {
+        sendJson(res, 400, {
+          ok: false,
+          error:
+            "The invoice due date cannot be before its issue date.",
+        });
+
+        return;
+      }
+
+      const timestamp = nowIso();
+
+      const invoice =
+        normalizeInvoice(
+          {
+            ...body,
+
+            id:
+              body.id ||
+              `invoice-${crypto.randomUUID()}`,
+
+            campaignId:
+              campaign.id,
+
+            contractId:
+              contract.id,
+
+            invoiceNumber,
+
+            status: "DRAFT",
+
+            subtotalCents,
+            taxCents,
+            totalCents,
+
+            amountPaidCents: 0,
+
+            balanceDueCents:
+              totalCents,
+
+            currency:
+              body.currency ||
+              campaign.currency ||
+              "USD",
+
+            issuedAt,
+            dueAt,
+            paidAt: null,
+
+            createdBy:
+              auth.actor,
+
+            updatedBy:
+              auth.actor,
+
+            createdAt:
+              timestamp,
+
+            updatedAt:
+              timestamp,
+          },
+
+          data.invoices.length
+        );
+
+      data.invoices.unshift(
+        invoice
+      );
+
+      campaign.invoiceId =
+        invoice.id;
+
+      campaign.updatedBy =
+        auth.actor;
+
+      campaign.updatedAt =
+        timestamp;
+
+      addAudit(
+        data,
+        "INVOICE_CREATED",
+        auth.actor,
+        `${invoice.id}: ${campaign.id}: ${contract.id}`
+      );
+
+      const saved =
+        writeData(data);
+
+      sendJson(res, 201, {
+        ok: true,
+
+        invoice:
+          saved.invoices.find(
+            (item) =>
+              item.id ===
+              invoice.id
+          ),
+
+        campaign:
+          saved.campaigns.find(
+            (item) =>
+              item.id ===
+              campaign.id
+          ),
+      });
+
+      return;
+    }
+
+    const invoiceStatusMatch =
+      pathname.match(
+        /^\/api\/admin\/commercial\/invoices\/([^/]+)\/status$/
+      );
+
+    if (
+      req.method === "PATCH" &&
+      invoiceStatusMatch
+    ) {
+      const body =
+        await readJsonBody(req);
+
+      const requestedStatus =
+        cleanText(
+          body.status,
+          60
+        ).toUpperCase();
+
+      if (
+        !INVOICE_STATUSES.has(
+          requestedStatus
+        )
+      ) {
+        sendJson(res, 400, {
+          ok: false,
+          error:
+            "Unknown invoice status.",
+
+          allowedStatuses:
+            Array.from(
+              INVOICE_STATUSES
+            ),
+        });
+
+        return;
+      }
+
+      const invoiceId =
+        cleanId(
+          decodeURIComponent(
+            invoiceStatusMatch[1]
+          ),
+          "invoice"
+        );
+
+      const data = readData();
+
+      const invoice =
+        data.invoices.find(
+          (item) =>
+            item.id === invoiceId
+        );
+
+      if (!invoice) {
+        sendJson(res, 404, {
+          ok: false,
+          error:
+            "Invoice was not found.",
+        });
+
+        return;
+      }
+
+      if (
+        requestedStatus ===
+          "PARTIALLY_PAID" ||
+        requestedStatus ===
+          "PAID" ||
+        requestedStatus ===
+          "REFUNDED"
+      ) {
+        sendJson(res, 409, {
+          ok: false,
+          error:
+            "Payment-bearing invoice statuses require a separately certified payment-recording workflow.",
+        });
+
+        return;
+      }
+
+      if (
+        requestedStatus ===
+        invoice.status
+      ) {
+        sendJson(res, 200, {
+          ok: true,
+          invoice,
+          unchanged: true,
+        });
+
+        return;
+      }
+
+      const transitionMap = {
+        DRAFT: new Set(["ISSUED", "VOID"]),
+        ISSUED: new Set(["PAST_DUE", "VOID"]),
+        PAST_DUE: new Set(["VOID"]),
+        PARTIALLY_PAID: new Set(),
+        PAID: new Set(),
+        VOID: new Set(),
+        REFUNDED: new Set(),
+      };
+
+      const permitted =
+        transitionMap[invoice.status] ||
+        new Set();
+
+      if (
+        !permitted.has(
+          requestedStatus
+        )
+      ) {
+        sendJson(res, 409, {
+          ok: false,
+          error:
+            "The requested invoice status transition is not permitted.",
+          currentStatus:
+            invoice.status,
+          requestedStatus,
+        });
+
+        return;
+      }
+
+      const timestamp = nowIso();
+
+      if (
+        requestedStatus ===
+          "ISSUED"
+      ) {
+        const issuedAt =
+          invoice.issuedAt ||
+          timestamp;
+
+        if (!invoice.dueAt) {
+          sendJson(res, 409, {
+            ok: false,
+            error:
+              "A valid dueAt value is required before an invoice can be ISSUED.",
+          });
+
+          return;
+        }
+
+        if (
+          Date.parse(
+            invoice.dueAt
+          ) <
+          Date.parse(
+            issuedAt
+          )
+        ) {
+          sendJson(res, 400, {
+            ok: false,
+            error:
+              "The invoice due date cannot be before its issue date.",
+          });
+
+          return;
+        }
+
+        invoice.issuedAt =
+          issuedAt;
+      }
+
+      const previousStatus =
+        invoice.status;
+
+      invoice.status =
+        requestedStatus;
+
+      invoice.updatedBy =
+        auth.actor;
+
+      invoice.updatedAt =
+        timestamp;
+
+      addAudit(
+        data,
+        "INVOICE_STATUS_UPDATED",
+        auth.actor,
+        `${invoice.id}: ${previousStatus} -> ${requestedStatus}`
+      );
+
+      if (
+        requestedStatus ===
+          "ISSUED"
+      ) {
+        addAudit(
+          data,
+          "INVOICE_ISSUED",
+          auth.actor,
+          `${invoice.id}: ${invoice.invoiceNumber}`
+        );
+      }
+
+      const saved =
+        writeData(data);
+
+      sendJson(res, 200, {
+        ok: true,
+
+        invoice:
+          saved.invoices.find(
+            (item) =>
+              item.id ===
+              invoice.id
+          ),
+      });
+
+      return;
+    }
+
     const statusMatch =
       pathname.match(
         /^\/api\/admin\/commercial\/campaigns\/([^/]+)\/status$/
