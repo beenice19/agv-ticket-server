@@ -1,9 +1,15 @@
 ﻿"use strict";
 
+require("dotenv").config();
+
 const http = require("http");
 const fs = require("fs");
 const path = require("path");
 const crypto = require("crypto");
+const jwt = require("jsonwebtoken");
+
+// PASS ANPE-02B1 — EXISTING AGV OWNER SESSION
+// Reuse the signed SERVER 8792 Owner/Admin session. No second login.
 
 const HOST = String(
   process.env.AGV_ANPE_HOST || "127.0.0.1"
@@ -21,6 +27,24 @@ const DATA_FILE = path.join(
 const ADMIN_TOKEN = String(
   process.env.AGV_ANPE_ADMIN_TOKEN || ""
 ).trim();
+
+const AGV_SESSION_SECRET = String(
+  process.env.AGV_SESSION_SECRET || ""
+).trim();
+
+const AGV_SUPER_ADMIN_EMAILS = new Set(
+  String(process.env.AGV_SUPER_ADMIN_EMAILS || "")
+    .split(",")
+    .map((email) => email.trim().toLowerCase())
+    .filter(Boolean)
+);
+
+const APPROVED_AGV_ADMIN_ROLES = new Set([
+  "owner",
+  "admin",
+  "super_admin",
+  "superadmin",
+]);
 
 const MAX_BODY_BYTES = 1_000_000;
 
@@ -761,65 +785,109 @@ function readJsonBody(req) {
 }
 
 function authorizeAdmin(req) {
-  if (!ADMIN_TOKEN) {
-    return {
-      ok: false,
-      status: 503,
-      error:
-        "AGV_ANPE_ADMIN_TOKEN is not configured. Administrative routes are locked.",
-    };
-  }
+  const authorization = cleanText(
+    req.headers.authorization,
+    4000
+  );
 
-  const authorization =
-    cleanText(
-      req.headers.authorization,
-      4000
-    );
-
-  const supplied =
-    authorization
-      .toLowerCase()
-      .startsWith("bearer ")
-      ? authorization
-          .slice(7)
-          .trim()
-      : "";
+  const supplied = authorization
+    .toLowerCase()
+    .startsWith("bearer ")
+    ? authorization.slice(7).trim()
+    : "";
 
   if (!supplied) {
     return {
       ok: false,
       status: 401,
       error:
-        "Missing ANPE administrator bearer token.",
+        "A verified AGV Founder or Super Admin session is required.",
     };
   }
 
-  const expectedBuffer =
-    Buffer.from(ADMIN_TOKEN);
+  const ownerSessionConfigured =
+    Boolean(AGV_SESSION_SECRET) &&
+    AGV_SUPER_ADMIN_EMAILS.size > 0;
 
-  const suppliedBuffer =
-    Buffer.from(supplied);
+  if (ownerSessionConfigured) {
+    try {
+      const claims = jwt.verify(
+        supplied,
+        AGV_SESSION_SECRET,
+        {
+          issuer: "agv-subscription-server",
+          audience: "agv-platform",
+        }
+      );
 
-  const matches =
-    expectedBuffer.length ===
-      suppliedBuffer.length &&
-    crypto.timingSafeEqual(
-      expectedBuffer,
-      suppliedBuffer
-    );
+      const email = cleanText(
+        claims?.email,
+        254
+      ).toLowerCase();
 
-  if (!matches) {
+      const role = cleanText(
+        claims?.role,
+        80
+      ).toLowerCase();
+
+      if (
+        claims?.tokenType !== "agv_host_session" ||
+        !email ||
+        !APPROVED_AGV_ADMIN_ROLES.has(role) ||
+        !AGV_SUPER_ADMIN_EMAILS.has(email)
+      ) {
+        return {
+          ok: false,
+          status: 403,
+          error:
+            "AGV Founder or Super Admin authorization is required.",
+        };
+      }
+
+      return {
+        ok: true,
+        actor: email,
+        email,
+        role,
+        source: "agv-subscription-server",
+      };
+    } catch {}
+  }
+
+  if (ADMIN_TOKEN) {
+    const expectedBuffer = Buffer.from(ADMIN_TOKEN);
+    const suppliedBuffer = Buffer.from(supplied);
+
+    const matches =
+      expectedBuffer.length === suppliedBuffer.length &&
+      crypto.timingSafeEqual(
+        expectedBuffer,
+        suppliedBuffer
+      );
+
+    if (matches) {
+      return {
+        ok: true,
+        actor: "ANPE_EMERGENCY_ADMIN",
+        source: "anpe-emergency-token",
+      };
+    }
+  }
+
+  if (!ownerSessionConfigured && !ADMIN_TOKEN) {
     return {
       ok: false,
-      status: 403,
+      status: 503,
       error:
-        "Invalid ANPE administrator bearer token.",
+        "AGV administrative authentication is not configured.",
     };
   }
 
   return {
-    ok: true,
-    actor: "ANPE_ADMIN",
+    ok: false,
+    status: 401,
+    error:
+      "Invalid or expired AGV administrative session.",
   };
 }
 
@@ -898,7 +966,20 @@ async function handleRequest(
         data.playoutEnabled,
 
       adminRoutesLocked:
+        !(
+          AGV_SESSION_SECRET &&
+          AGV_SUPER_ADMIN_EMAILS.size
+        ) &&
         !ADMIN_TOKEN,
+
+      adminAuthentication: {
+        agvOwnerSession:
+          Boolean(
+            AGV_SESSION_SECRET &&
+            AGV_SUPER_ADMIN_EMAILS.size
+          ),
+        emergencyToken: Boolean(ADMIN_TOKEN),
+      },
 
       dataFile:
         DATA_FILE,
@@ -1298,7 +1379,16 @@ function startServer() {
       );
 
       console.log(
-        `Administrative routes locked: ${!ADMIN_TOKEN}`
+        `SERVER 8792 Owner/Admin session auth: ${Boolean(
+          AGV_SESSION_SECRET &&
+          AGV_SUPER_ADMIN_EMAILS.size
+        )}`
+      );
+
+      console.log(
+        `ANPE emergency token configured: ${Boolean(
+          ADMIN_TOKEN
+        )}`
       );
 
       console.log(
