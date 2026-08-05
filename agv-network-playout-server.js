@@ -1960,6 +1960,12 @@ async function handleRequest(
 
             status: "DRAFT",
 
+            createdBy:
+              auth.actor,
+
+            updatedBy:
+              auth.actor,
+
             createdAt:
               nowIso(),
 
@@ -1988,6 +1994,319 @@ async function handleRequest(
         ok: true,
         campaign:
           saved.campaigns[0],
+      });
+
+      return;
+    }
+
+    // PASS ANPE-02D1 — ADMIN CONTRACT WORKFLOW ROUTES
+    // Administrative foundation only. No public sale or billing execution.
+    if (
+      req.method === "GET" &&
+      pathname ===
+        "/api/admin/commercial/contracts"
+    ) {
+      const data = readData();
+
+      const campaignId = cleanText(
+        url.searchParams.get("campaignId"),
+        160
+      );
+
+      const contracts = campaignId
+        ? data.contracts.filter(
+            (item) =>
+              item.campaignId ===
+              campaignId
+          )
+        : data.contracts;
+
+      sendJson(res, 200, {
+        ok: true,
+        contracts,
+        count: contracts.length,
+      });
+
+      return;
+    }
+
+    if (
+      req.method === "POST" &&
+      pathname ===
+        "/api/admin/commercial/contracts"
+    ) {
+      const body =
+        await readJsonBody(req);
+
+      const campaignId = cleanText(
+        body.campaignId,
+        160
+      );
+
+      if (!campaignId) {
+        sendJson(res, 400, {
+          ok: false,
+          error:
+            "A campaignId is required.",
+        });
+
+        return;
+      }
+
+      const data = readData();
+
+      const campaign =
+        data.campaigns.find(
+          (item) =>
+            item.id === campaignId
+        );
+
+      if (!campaign) {
+        sendJson(res, 404, {
+          ok: false,
+          error:
+            "Campaign was not found.",
+        });
+
+        return;
+      }
+
+      const existingContract =
+        data.contracts.find(
+          (item) =>
+            item.campaignId ===
+              campaignId &&
+            item.status !== "VOID" &&
+            item.status !==
+              "CANCELLED"
+        );
+
+      if (existingContract) {
+        sendJson(res, 409, {
+          ok: false,
+          error:
+            "This campaign already has an active contract record.",
+          contract:
+            existingContract,
+        });
+
+        return;
+      }
+
+      const timestamp = nowIso();
+
+      const contract =
+        normalizeContract(
+          {
+            ...body,
+
+            id:
+              body.id ||
+              `contract-${crypto.randomUUID()}`,
+
+            campaignId:
+              campaign.id,
+
+            organization:
+              body.organization ||
+              campaign.organization,
+
+            buyerName:
+              body.buyerName ||
+              campaign.buyerName,
+
+            buyerEmail:
+              body.buyerEmail ||
+              campaign.buyerEmail,
+
+            contactPhone:
+              body.contactPhone ||
+              campaign.contactPhone,
+
+            status: "DRAFT",
+
+            createdBy:
+              auth.actor,
+
+            updatedBy:
+              auth.actor,
+
+            createdAt:
+              timestamp,
+
+            updatedAt:
+              timestamp,
+          },
+
+          data.contracts.length
+        );
+
+      data.contracts.unshift(
+        contract
+      );
+
+      campaign.contractId =
+        contract.id;
+
+      campaign.updatedBy =
+        auth.actor;
+
+      campaign.updatedAt =
+        timestamp;
+
+      addAudit(
+        data,
+        "CONTRACT_CREATED",
+        auth.actor,
+        `${contract.id}: ${campaign.id}`
+      );
+
+      const saved =
+        writeData(data);
+
+      sendJson(res, 201, {
+        ok: true,
+
+        contract:
+          saved.contracts.find(
+            (item) =>
+              item.id ===
+              contract.id
+          ),
+
+        campaign:
+          saved.campaigns.find(
+            (item) =>
+              item.id ===
+              campaign.id
+          ),
+      });
+
+      return;
+    }
+
+    const contractStatusMatch =
+      pathname.match(
+        /^\/api\/admin\/commercial\/contracts\/([^/]+)\/status$/
+      );
+
+    if (
+      req.method === "PATCH" &&
+      contractStatusMatch
+    ) {
+      const body =
+        await readJsonBody(req);
+
+      const requestedStatus =
+        cleanText(
+          body.status,
+          60
+        ).toUpperCase();
+
+      if (
+        !CONTRACT_STATUSES.has(
+          requestedStatus
+        )
+      ) {
+        sendJson(res, 400, {
+          ok: false,
+          error:
+            "Unknown contract status.",
+
+          allowedStatuses:
+            Array.from(
+              CONTRACT_STATUSES
+            ),
+        });
+
+        return;
+      }
+
+      const contractId =
+        cleanId(
+          decodeURIComponent(
+            contractStatusMatch[1]
+          ),
+          "contract"
+        );
+
+      const data = readData();
+
+      const contract =
+        data.contracts.find(
+          (item) =>
+            item.id === contractId
+        );
+
+      if (!contract) {
+        sendJson(res, 404, {
+          ok: false,
+          error:
+            "Contract was not found.",
+        });
+
+        return;
+      }
+
+      const previousStatus =
+        contract.status;
+
+      const timestamp = nowIso();
+
+      contract.status =
+        requestedStatus;
+
+      if (
+        requestedStatus === "SIGNED" &&
+        !contract.signedAt
+      ) {
+        contract.signedAt =
+          timestamp;
+      }
+
+      contract.updatedBy =
+        auth.actor;
+
+      contract.updatedAt =
+        timestamp;
+
+      const campaign =
+        data.campaigns.find(
+          (item) =>
+            item.id ===
+            contract.campaignId
+        );
+
+      if (campaign) {
+        campaign.contractId =
+          contract.id;
+
+        campaign.updatedBy =
+          auth.actor;
+
+        campaign.updatedAt =
+          timestamp;
+      }
+
+      addAudit(
+        data,
+        "CONTRACT_STATUS_UPDATED",
+        auth.actor,
+        `${contract.id}: ${previousStatus} -> ${requestedStatus}`
+      );
+
+      const saved =
+        writeData(data);
+
+      sendJson(res, 200, {
+        ok: true,
+
+        contract:
+          saved.contracts.find(
+            (item) =>
+              item.id ===
+              contract.id
+          ),
       });
 
       return;
