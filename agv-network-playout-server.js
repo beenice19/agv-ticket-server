@@ -3,6 +3,7 @@
 require("dotenv").config();
 
 const http = require("http");
+const https = require("https");
 const fs = require("fs");
 const path = require("path");
 const crypto = require("crypto");
@@ -27,6 +28,24 @@ const DATA_FILE = path.join(
 const ADMIN_TOKEN = String(
   process.env.AGV_ANPE_ADMIN_TOKEN || ""
 ).trim();
+
+// PASS ANPE-02B2B — SERVER 8787 SUPER ADMIN BRIDGE
+// Validate the existing SERVER 8787 session through /api/auth/me.
+// ANPE does not copy the 8787 JWT secret, passwords, or user database.
+const AGV_AUTH_BASE_URL = String(
+  process.env.AGV_AUTH_BASE_URL ||
+    "http://127.0.0.1:8787"
+)
+  .trim()
+  .replace(/\/+$/, "");
+
+const AGV_AUTH_TIMEOUT_MS = Math.max(
+  1000,
+  Number(
+    process.env.AGV_AUTH_TIMEOUT_MS ||
+      5000
+  ) || 5000
+);
 
 const AGV_SESSION_SECRET = String(
   process.env.AGV_SESSION_SECRET || ""
@@ -784,17 +803,310 @@ function readJsonBody(req) {
   );
 }
 
-function authorizeAdmin(req) {
+function getBearerToken(req) {
   const authorization = cleanText(
     req.headers.authorization,
     4000
   );
 
-  const supplied = authorization
+  return authorization
     .toLowerCase()
     .startsWith("bearer ")
     ? authorization.slice(7).trim()
     : "";
+}
+
+function verifyOwnerAdminSession(
+  supplied
+) {
+  const configured =
+    Boolean(AGV_SESSION_SECRET) &&
+    AGV_SUPER_ADMIN_EMAILS.size > 0;
+
+  if (!configured) {
+    return {
+      ok: false,
+      configured: false,
+    };
+  }
+
+  try {
+    const claims = jwt.verify(
+      supplied,
+      AGV_SESSION_SECRET,
+      {
+        issuer: "agv-subscription-server",
+        audience: "agv-platform",
+      }
+    );
+
+    const email = cleanText(
+      claims?.email,
+      254
+    ).toLowerCase();
+
+    const role = cleanText(
+      claims?.role,
+      80
+    ).toLowerCase();
+
+    if (
+      claims?.tokenType !== "agv_host_session" ||
+      !email ||
+      !APPROVED_AGV_ADMIN_ROLES.has(role) ||
+      !AGV_SUPER_ADMIN_EMAILS.has(email)
+    ) {
+      return {
+        ok: false,
+        configured: true,
+        status: 403,
+        error:
+          "AGV Founder or Super Admin authorization is required.",
+      };
+    }
+
+    return {
+      ok: true,
+      actor: email,
+      email,
+      role,
+      source: "agv-subscription-server",
+    };
+  }
+  catch {
+    return {
+      ok: false,
+      configured: true,
+      status: 401,
+    };
+  }
+}
+
+function validate8787Superadmin(
+  supplied
+) {
+  return new Promise((resolve) => {
+    if (!AGV_AUTH_BASE_URL) {
+      resolve({
+        ok: false,
+        configured: false,
+      });
+
+      return;
+    }
+
+    let endpoint;
+
+    try {
+      endpoint = new URL(
+        `${AGV_AUTH_BASE_URL}/api/auth/me`
+      );
+    }
+    catch {
+      resolve({
+        ok: false,
+        configured: false,
+        unavailable: true,
+        error:
+          "SERVER 8787 authentication URL is invalid.",
+      });
+
+      return;
+    }
+
+    const transport =
+      endpoint.protocol === "https:"
+        ? https
+        : http;
+
+    const request =
+      transport.request(
+        endpoint,
+        {
+          method: "GET",
+
+          headers: {
+            Accept:
+              "application/json",
+
+            Authorization:
+              `Bearer ${supplied}`,
+          },
+        },
+        (response) => {
+          const chunks = [];
+          let size = 0;
+
+          response.on(
+            "data",
+            (chunk) => {
+              size += chunk.length;
+
+              if (size <= 100000) {
+                chunks.push(chunk);
+              }
+            }
+          );
+
+          response.on(
+            "end",
+            () => {
+              const status = Number(
+                response.statusCode ||
+                500
+              );
+
+              let payload = {};
+
+              try {
+                payload = JSON.parse(
+                  Buffer.concat(chunks)
+                    .toString("utf8")
+                );
+              }
+              catch {
+                payload = {};
+              }
+
+              if (
+                status === 200 &&
+                payload?.ok === true &&
+                payload?.user
+              ) {
+                if (
+                  payload.user.globalRole !==
+                  "superadmin"
+                ) {
+                  resolve({
+                    ok: false,
+                    configured: true,
+                    status: 403,
+                    error:
+                      "SERVER 8787 Super Admin authorization is required.",
+                  });
+
+                  return;
+                }
+
+                const actor = cleanText(
+                  payload.user.username ||
+                    payload.user.displayName ||
+                    "AGV_SUPERADMIN",
+                  254
+                );
+
+                resolve({
+                  ok: true,
+                  actor,
+                  source: "agv-server-8787",
+                  user: payload.user,
+                });
+
+                return;
+              }
+
+              if (status === 403) {
+                resolve({
+                  ok: false,
+                  configured: true,
+                  status: 403,
+                  error:
+                    "SERVER 8787 Super Admin authorization is required.",
+                });
+
+                return;
+              }
+
+              if (status === 401) {
+                resolve({
+                  ok: false,
+                  configured: true,
+                  status: 401,
+                });
+
+                return;
+              }
+
+              resolve({
+                ok: false,
+                configured: true,
+                unavailable: true,
+                error:
+                  `SERVER 8787 authentication returned HTTP ${status}.`,
+              });
+            }
+          );
+        }
+      );
+
+    request.setTimeout(
+      AGV_AUTH_TIMEOUT_MS,
+      () => {
+        request.destroy(
+          new Error(
+            "SERVER 8787 authentication timed out."
+          )
+        );
+      }
+    );
+
+    request.on(
+      "error",
+      (error) => {
+        resolve({
+          ok: false,
+          configured: true,
+          unavailable: true,
+          error:
+            error.message ||
+            "SERVER 8787 authentication is unavailable.",
+        });
+      }
+    );
+
+    request.end();
+  });
+}
+
+function validateEmergencyToken(
+  supplied
+) {
+  if (!ADMIN_TOKEN) {
+    return {
+      ok: false,
+      configured: false,
+    };
+  }
+
+  const expectedBuffer =
+    Buffer.from(ADMIN_TOKEN);
+
+  const suppliedBuffer =
+    Buffer.from(supplied);
+
+  const matches =
+    expectedBuffer.length ===
+      suppliedBuffer.length &&
+    crypto.timingSafeEqual(
+      expectedBuffer,
+      suppliedBuffer
+    );
+
+  return matches
+    ? {
+        ok: true,
+        actor: "ANPE_EMERGENCY_ADMIN",
+        source: "anpe-emergency-token",
+      }
+    : {
+        ok: false,
+        configured: true,
+      };
+}
+
+async function authorizeAdmin(req) {
+  const supplied =
+    getBearerToken(req);
 
   if (!supplied) {
     return {
@@ -805,81 +1117,51 @@ function authorizeAdmin(req) {
     };
   }
 
-  const ownerSessionConfigured =
-    Boolean(AGV_SESSION_SECRET) &&
-    AGV_SUPER_ADMIN_EMAILS.size > 0;
+  const ownerSession =
+    verifyOwnerAdminSession(
+      supplied
+    );
 
-  if (ownerSessionConfigured) {
-    try {
-      const claims = jwt.verify(
-        supplied,
-        AGV_SESSION_SECRET,
-        {
-          issuer: "agv-subscription-server",
-          audience: "agv-platform",
-        }
-      );
-
-      const email = cleanText(
-        claims?.email,
-        254
-      ).toLowerCase();
-
-      const role = cleanText(
-        claims?.role,
-        80
-      ).toLowerCase();
-
-      if (
-        claims?.tokenType !== "agv_host_session" ||
-        !email ||
-        !APPROVED_AGV_ADMIN_ROLES.has(role) ||
-        !AGV_SUPER_ADMIN_EMAILS.has(email)
-      ) {
-        return {
-          ok: false,
-          status: 403,
-          error:
-            "AGV Founder or Super Admin authorization is required.",
-        };
-      }
-
-      return {
-        ok: true,
-        actor: email,
-        email,
-        role,
-        source: "agv-subscription-server",
-      };
-    } catch {}
+  if (ownerSession.ok) {
+    return ownerSession;
   }
 
-  if (ADMIN_TOKEN) {
-    const expectedBuffer = Buffer.from(ADMIN_TOKEN);
-    const suppliedBuffer = Buffer.from(supplied);
+  const server8787 =
+    await validate8787Superadmin(
+      supplied
+    );
 
-    const matches =
-      expectedBuffer.length === suppliedBuffer.length &&
-      crypto.timingSafeEqual(
-        expectedBuffer,
-        suppliedBuffer
-      );
-
-    if (matches) {
-      return {
-        ok: true,
-        actor: "ANPE_EMERGENCY_ADMIN",
-        source: "anpe-emergency-token",
-      };
-    }
+  if (server8787.ok) {
+    return server8787;
   }
 
-  if (!ownerSessionConfigured && !ADMIN_TOKEN) {
+  const emergencyToken =
+    validateEmergencyToken(
+      supplied
+    );
+
+  if (emergencyToken.ok) {
+    return emergencyToken;
+  }
+
+  if (
+    ownerSession.status === 403 ||
+    server8787.status === 403
+  ) {
+    return {
+      ok: false,
+      status: 403,
+      error:
+        "AGV Founder or Super Admin authorization is required.",
+    };
+  }
+
+  if (server8787.unavailable) {
     return {
       ok: false,
       status: 503,
       error:
-        "AGV administrative authentication is not configured.",
+        "SERVER 8787 administrative authentication is temporarily unavailable.",
     };
   }
 
@@ -966,6 +1248,7 @@ async function handleRequest(
         data.playoutEnabled,
 
       adminRoutesLocked:
+        !AGV_AUTH_BASE_URL &&
         !(
           AGV_SESSION_SECRET &&
           AGV_SUPER_ADMIN_EMAILS.size
@@ -973,12 +1256,19 @@ async function handleRequest(
         !ADMIN_TOKEN,
 
       adminAuthentication: {
+        server8787Bridge:
+          Boolean(
+            AGV_AUTH_BASE_URL
+          ),
+
         agvOwnerSession:
           Boolean(
             AGV_SESSION_SECRET &&
             AGV_SUPER_ADMIN_EMAILS.size
           ),
-        emergencyToken: Boolean(ADMIN_TOKEN),
+
+        emergencyToken:
+          Boolean(ADMIN_TOKEN),
       },
 
       dataFile:
@@ -1022,7 +1312,7 @@ async function handleRequest(
     )
   ) {
     const auth =
-      authorizeAdmin(req);
+      await authorizeAdmin(req);
 
     if (!auth.ok) {
       sendJson(
@@ -1376,6 +1666,12 @@ function startServer() {
 
       console.log(
         "Viewer access model: FREE_TO_VIEW"
+      );
+
+      console.log(
+        `SERVER 8787 Super Admin bridge: ${Boolean(
+          AGV_AUTH_BASE_URL
+        )}`
       );
 
       console.log(
