@@ -20,10 +20,21 @@ const PORT = Number(
   process.env.AGV_ANPE_PORT || 8802
 );
 
-const DATA_FILE = path.join(
-  __dirname,
-  "agv-network-playout.json"
-);
+const CONFIGURED_DATA_FILE = String(
+  process.env.AGV_ANPE_DATA_FILE ||
+    ""
+).trim();
+
+const DATA_FILE =
+  CONFIGURED_DATA_FILE
+    ? path.resolve(
+        __dirname,
+        CONFIGURED_DATA_FILE
+      )
+    : path.join(
+        __dirname,
+        "agv-network-playout.json"
+      );
 
 const ADMIN_TOKEN = String(
   process.env.AGV_ANPE_ADMIN_TOKEN || ""
@@ -101,6 +112,39 @@ const CAMPAIGN_STATUSES = new Set([
   "COMPLETED",
   "CANCELLED",
   "REJECTED",
+]);
+
+// PASS ANPE-02C3B — COMMERCIAL RELATIONSHIP SCHEMA
+// Schema only. Sales, billing, and playout remain disabled.
+const CONTRACT_STATUSES = new Set([
+  "DRAFT",
+  "PENDING_REVIEW",
+  "APPROVED",
+  "SIGNED",
+  "ACTIVE",
+  "COMPLETED",
+  "CANCELLED",
+  "VOID",
+]);
+
+const SCHEDULE_PLACEMENT_STATUSES = new Set([
+  "DRAFT",
+  "HOLD",
+  "CONFIRMED",
+  "SCHEDULED",
+  "AIRED",
+  "MISSED",
+  "CANCELLED",
+]);
+
+const INVOICE_STATUSES = new Set([
+  "DRAFT",
+  "ISSUED",
+  "PARTIALLY_PAID",
+  "PAID",
+  "PAST_DUE",
+  "VOID",
+  "REFUNDED",
 ]);
 
 function nowIso() {
@@ -277,7 +321,7 @@ function defaultData() {
   const timestamp = nowIso();
 
   return {
-    schemaVersion: 1,
+    schemaVersion: 2,
 
     service:
       "AGV Network Playout & Enterprise Revenue Engine",
@@ -296,6 +340,12 @@ function defaultData() {
       defaultProductionServices(),
 
     campaigns: [],
+
+    contracts: [],
+
+    schedulePlacements: [],
+
+    invoices: [],
 
     proofOfPlay: [],
 
@@ -424,6 +474,12 @@ function normalizeCampaign(item, index) {
       254
     ).toLowerCase(),
 
+    contactPhone: cleanText(
+      source.contactPhone ||
+        source.buyerPhone,
+      80
+    ),
+
     organization: cleanText(
       source.organization,
       180
@@ -447,6 +503,27 @@ function normalizeCampaign(item, index) {
     programId: cleanId(
       source.programId,
       "program"
+    ),
+
+    contractId: cleanText(
+      source.contractId,
+      160
+    ),
+
+    schedulePlacementIds:
+      Array.isArray(
+        source.schedulePlacementIds
+      )
+        ? source.schedulePlacementIds
+            .map((value) =>
+              cleanText(value, 160)
+            )
+            .filter(Boolean)
+        : [],
+
+    invoiceId: cleanText(
+      source.invoiceId,
+      160
     ),
 
     startAt:
@@ -503,6 +580,357 @@ function normalizeCampaign(item, index) {
       2000
     ),
 
+    createdBy: cleanText(
+      source.createdBy,
+      254
+    ),
+
+    updatedBy: cleanText(
+      source.updatedBy,
+      254
+    ),
+
+    createdAt:
+      nullableIso(source.createdAt) ||
+      nowIso(),
+
+    updatedAt:
+      nullableIso(source.updatedAt) ||
+      nowIso(),
+  };
+}
+
+function normalizeContract(item, index) {
+  const source =
+    item && typeof item === "object"
+      ? item
+      : {};
+
+  const requestedStatus = cleanText(
+    source.status || "DRAFT",
+    60
+  ).toUpperCase();
+
+  return {
+    id: cleanId(
+      source.id,
+      `contract-${index + 1}`
+    ),
+
+    campaignId: cleanText(
+      source.campaignId,
+      160
+    ),
+
+    contractNumber: cleanText(
+      source.contractNumber,
+      120
+    ),
+
+    title: cleanText(
+      source.title ||
+        `Commercial Contract ${index + 1}`,
+      180
+    ),
+
+    organization: cleanText(
+      source.organization,
+      180
+    ),
+
+    buyerName: cleanText(
+      source.buyerName,
+      180
+    ),
+
+    buyerEmail: cleanText(
+      source.buyerEmail,
+      254
+    ).toLowerCase(),
+
+    contactPhone: cleanText(
+      source.contactPhone,
+      80
+    ),
+
+    status:
+      CONTRACT_STATUSES.has(
+        requestedStatus
+      )
+        ? requestedStatus
+        : "DRAFT",
+
+    effectiveAt:
+      nullableIso(source.effectiveAt),
+
+    expiresAt:
+      nullableIso(source.expiresAt),
+
+    signedAt:
+      nullableIso(source.signedAt),
+
+    totalAmountCents:
+      nonnegativeInteger(
+        source.totalAmountCents
+      ),
+
+    currency: cleanText(
+      source.currency || "USD",
+      10
+    ).toUpperCase(),
+
+    terms: cleanText(
+      source.terms,
+      10000
+    ),
+
+    notes: cleanText(
+      source.notes,
+      2000
+    ),
+
+    createdBy: cleanText(
+      source.createdBy,
+      254
+    ),
+
+    updatedBy: cleanText(
+      source.updatedBy,
+      254
+    ),
+
+    createdAt:
+      nullableIso(source.createdAt) ||
+      nowIso(),
+
+    updatedAt:
+      nullableIso(source.updatedAt) ||
+      nowIso(),
+  };
+}
+
+function normalizeSchedulePlacement(
+  item,
+  index
+) {
+  const source =
+    item && typeof item === "object"
+      ? item
+      : {};
+
+  const requestedStatus = cleanText(
+    source.status || "DRAFT",
+    60
+  ).toUpperCase();
+
+  return {
+    id: cleanId(
+      source.id,
+      `schedule-placement-${index + 1}`
+    ),
+
+    campaignId: cleanText(
+      source.campaignId,
+      160
+    ),
+
+    contractId: cleanText(
+      source.contractId,
+      160
+    ),
+
+    stationId: cleanId(
+      source.stationId,
+      "station"
+    ),
+
+    programId: cleanId(
+      source.programId,
+      "program"
+    ),
+
+    offerId: cleanId(
+      source.offerId,
+      "offer"
+    ),
+
+    placementType: cleanText(
+      source.placementType || "AIRTIME_SPOT",
+      80
+    ).toUpperCase(),
+
+    scheduledStartAt:
+      nullableIso(
+        source.scheduledStartAt ||
+          source.startAt
+      ),
+
+    scheduledEndAt:
+      nullableIso(
+        source.scheduledEndAt ||
+          source.endAt
+      ),
+
+    durationSeconds:
+      nonnegativeInteger(
+        source.durationSeconds
+      ),
+
+    quantity: Math.max(
+      1,
+      nonnegativeInteger(
+        source.quantity || 1
+      )
+    ),
+
+    sequence:
+      nonnegativeInteger(
+        source.sequence
+      ),
+
+    status:
+      SCHEDULE_PLACEMENT_STATUSES.has(
+        requestedStatus
+      )
+        ? requestedStatus
+        : "DRAFT",
+
+    creativeAssetId: cleanText(
+      source.creativeAssetId,
+      160
+    ),
+
+    notes: cleanText(
+      source.notes,
+      2000
+    ),
+
+    createdBy: cleanText(
+      source.createdBy,
+      254
+    ),
+
+    updatedBy: cleanText(
+      source.updatedBy,
+      254
+    ),
+
+    createdAt:
+      nullableIso(source.createdAt) ||
+      nowIso(),
+
+    updatedAt:
+      nullableIso(source.updatedAt) ||
+      nowIso(),
+  };
+}
+
+function normalizeInvoice(item, index) {
+  const source =
+    item && typeof item === "object"
+      ? item
+      : {};
+
+  const requestedStatus = cleanText(
+    source.status || "DRAFT",
+    60
+  ).toUpperCase();
+
+  const subtotalCents =
+    nonnegativeInteger(
+      source.subtotalCents
+    );
+
+  const taxCents =
+    nonnegativeInteger(
+      source.taxCents
+    );
+
+  const totalCents =
+    nonnegativeInteger(
+      source.totalCents ||
+        subtotalCents + taxCents
+    );
+
+  const amountPaidCents =
+    nonnegativeInteger(
+      source.amountPaidCents
+    );
+
+  return {
+    id: cleanId(
+      source.id,
+      `invoice-${index + 1}`
+    ),
+
+    campaignId: cleanText(
+      source.campaignId,
+      160
+    ),
+
+    contractId: cleanText(
+      source.contractId,
+      160
+    ),
+
+    invoiceNumber: cleanText(
+      source.invoiceNumber,
+      120
+    ),
+
+    status:
+      INVOICE_STATUSES.has(
+        requestedStatus
+      )
+        ? requestedStatus
+        : "DRAFT",
+
+    subtotalCents,
+    taxCents,
+    totalCents,
+    amountPaidCents,
+
+    balanceDueCents:
+      source.balanceDueCents ===
+      undefined
+        ? Math.max(
+            0,
+            totalCents -
+              amountPaidCents
+          )
+        : nonnegativeInteger(
+            source.balanceDueCents
+          ),
+
+    currency: cleanText(
+      source.currency || "USD",
+      10
+    ).toUpperCase(),
+
+    issuedAt:
+      nullableIso(source.issuedAt),
+
+    dueAt:
+      nullableIso(source.dueAt),
+
+    paidAt:
+      nullableIso(source.paidAt),
+
+    notes: cleanText(
+      source.notes,
+      2000
+    ),
+
+    createdBy: cleanText(
+      source.createdBy,
+      254
+    ),
+
+    updatedBy: cleanText(
+      source.updatedBy,
+      254
+    ),
+
     createdAt:
       nullableIso(source.createdAt) ||
       nowIso(),
@@ -536,8 +964,25 @@ function normalizeData(value) {
       ? source.campaigns
       : [];
 
+  const contractSource =
+    Array.isArray(source.contracts)
+      ? source.contracts
+      : [];
+
+  const schedulePlacementSource =
+    Array.isArray(
+      source.schedulePlacements
+    )
+      ? source.schedulePlacements
+      : [];
+
+  const invoiceSource =
+    Array.isArray(source.invoices)
+      ? source.invoices
+      : [];
+
   return {
-    schemaVersion: 1,
+    schemaVersion: 2,
 
     service:
       "AGV Network Playout & Enterprise Revenue Engine",
@@ -582,6 +1027,21 @@ function normalizeData(value) {
     campaigns:
       campaignSource.map(
         normalizeCampaign
+      ),
+
+    contracts:
+      contractSource.map(
+        normalizeContract
+      ),
+
+    schedulePlacements:
+      schedulePlacementSource.map(
+        normalizeSchedulePlacement
+      ),
+
+    invoices:
+      invoiceSource.map(
+        normalizeInvoice
       ),
 
     proofOfPlay:
@@ -1283,6 +1743,15 @@ async function handleRequest(
       campaignCount:
         data.campaigns.length,
 
+      contractCount:
+        data.contracts.length,
+
+      schedulePlacementCount:
+        data.schedulePlacements.length,
+
+      invoiceCount:
+        data.invoices.length,
+
       now:
         nowIso(),
     });
@@ -1733,6 +2202,28 @@ function runSelfTest() {
     );
   }
 
+  if (!Array.isArray(data.contracts)) {
+    errors.push(
+      "contracts must be an array."
+    );
+  }
+
+  if (
+    !Array.isArray(
+      data.schedulePlacements
+    )
+  ) {
+    errors.push(
+      "schedulePlacements must be an array."
+    );
+  }
+
+  if (!Array.isArray(data.invoices)) {
+    errors.push(
+      "invoices must be an array."
+    );
+  }
+
   if (
     data.commercialSalesEnabled ||
     data.publicOrderIntakeEnabled ||
@@ -1770,6 +2261,18 @@ function runSelfTest() {
   );
 
   console.log(
+    `Contracts: ${data.contracts.length}`
+  );
+
+  console.log(
+    `Schedule placements: ${data.schedulePlacements.length}`
+  );
+
+  console.log(
+    `Invoices: ${data.invoices.length}`
+  );
+
+  console.log(
     `Viewer access model: ${data.viewerAccessModel}`
   );
 
@@ -1802,6 +2305,9 @@ module.exports = {
   defaultData,
   normalizeData,
   normalizeCampaign,
+  normalizeContract,
+  normalizeSchedulePlacement,
+  normalizeInvoice,
   normalizeOffer,
   readData,
   writeData,
