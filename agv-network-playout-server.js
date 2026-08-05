@@ -907,6 +907,93 @@ function normalizePaymentRecord(
   };
 }
 
+function normalizeRefundRecord(
+  item,
+  index,
+  invoiceId,
+  invoiceCurrency
+) {
+  const source =
+    item && typeof item === "object"
+      ? item
+      : {};
+
+  return {
+    id: cleanId(
+      source.id,
+      "refund-record-" + (index + 1)
+    ),
+
+    invoiceId: cleanText(
+      source.invoiceId ||
+        invoiceId,
+      160
+    ),
+
+    status: "RECORDED",
+
+    amountCents:
+      nonnegativeInteger(
+        source.amountCents
+      ),
+
+    currency: cleanText(
+      source.currency ||
+        invoiceCurrency ||
+        "USD",
+      10
+    ).toUpperCase(),
+
+    refundMethod: cleanText(
+      source.refundMethod ||
+        "OTHER",
+      60
+    ).toUpperCase(),
+
+    refundProvider: cleanText(
+      source.refundProvider ||
+        "MANUAL",
+      80
+    ).toUpperCase(),
+
+    refundReference: cleanText(
+      source.refundReference,
+      200
+    ),
+
+    externalRefundId:
+      cleanText(
+        source.externalRefundId,
+        200
+      ),
+
+    refundReason: cleanText(
+      source.refundReason,
+      1000
+    ),
+
+    refundedAt:
+      nullableIso(source.refundedAt),
+
+    recordedAt:
+      nullableIso(source.recordedAt) ||
+      nowIso(),
+
+    recordedBy: cleanText(
+      source.recordedBy,
+      254
+    ),
+
+    evidenceNote: cleanText(
+      source.evidenceNote,
+      2000
+    ),
+
+    attestation:
+      source.attestation === true,
+  };
+}
+
 function normalizeInvoice(item, index) {
   const source =
     item && typeof item === "object"
@@ -964,6 +1051,24 @@ function normalizeInvoice(item, index) {
         )
     );
 
+  const refundRecordSource =
+    Array.isArray(
+      source.refundRecords
+    )
+      ? source.refundRecords
+      : [];
+
+  const refundRecords =
+    refundRecordSource.map(
+      (refundRecord, refundIndex) =>
+        normalizeRefundRecord(
+          refundRecord,
+          refundIndex,
+          invoiceIdForRecords,
+          invoiceCurrency
+        )
+    );
+
   const recordedPaymentTotalCents =
     paymentRecords.reduce(
       (sum, paymentRecord) =>
@@ -983,6 +1088,39 @@ function normalizeInvoice(item, index) {
       : nonnegativeInteger(
           source.amountPaidCents
         );
+
+  const recordedRefundTotalCents =
+    refundRecords.reduce(
+      (sum, refundRecord) =>
+        sum +
+        nonnegativeInteger(
+          refundRecord.amountCents
+        ),
+      0
+    );
+
+  const amountRefundedCents =
+    refundRecords.length > 0
+      ? Math.min(
+          amountPaidCents,
+          recordedRefundTotalCents
+        )
+      : Math.min(
+          amountPaidCents,
+          nonnegativeInteger(
+            source.amountRefundedCents
+          )
+        );
+
+  const refundableAmountCents =
+    Math.max(
+      0,
+      amountPaidCents -
+        amountRefundedCents
+    );
+
+  const netCollectedCents =
+    refundableAmountCents;
 
   return {
     id: cleanId(
@@ -1016,6 +1154,9 @@ function normalizeInvoice(item, index) {
     taxCents,
     totalCents,
     amountPaidCents,
+    amountRefundedCents,
+    refundableAmountCents,
+    netCollectedCents,
 
     balanceDueCents:
       paymentRecords.length > 0 ||
@@ -1054,6 +1195,22 @@ function normalizeInvoice(item, index) {
         ? paymentRecords[0]
             .receivedAt ||
           paymentRecords[0]
+            .recordedAt
+        : ""),
+
+    refundRecords,
+
+    refundedAt:
+      nullableIso(source.refundedAt),
+
+    lastRefundAt:
+      nullableIso(
+        source.lastRefundAt
+      ) ||
+      (refundRecords.length > 0
+        ? refundRecords[0]
+            .refundedAt ||
+          refundRecords[0]
             .recordedAt
         : ""),
 
@@ -3999,6 +4156,592 @@ async function handleRequest(
               (item) =>
                 item.id ===
                 paymentRecord.id
+            ),
+
+        invoice:
+          savedInvoice,
+      });
+
+      return;
+    }
+
+    // PASS ANPE-02H1B — CONTROLLED REFUND-RECORDING ROUTES
+    // Records external refund evidence only. No processor or money movement.
+    const invoiceRefundsMatch =
+      pathname.match(
+        /^\/api\/admin\/commercial\/invoices\/([^/]+)\/refunds$/
+      );
+
+    if (
+      req.method === "GET" &&
+      invoiceRefundsMatch
+    ) {
+      const invoiceId =
+        cleanId(
+          decodeURIComponent(
+            invoiceRefundsMatch[1]
+          ),
+          "invoice"
+        );
+
+      const data = readData();
+
+      const invoice =
+        data.invoices.find(
+          (item) =>
+            item.id === invoiceId
+        );
+
+      if (!invoice) {
+        sendJson(res, 404, {
+          ok: false,
+          error:
+            "Invoice was not found.",
+        });
+
+        return;
+      }
+
+      const refundRecords =
+        Array.isArray(
+          invoice.refundRecords
+        )
+          ? invoice.refundRecords
+          : [];
+
+      sendJson(res, 200, {
+        ok: true,
+
+        invoiceId:
+          invoice.id,
+
+        refundRecords,
+
+        count:
+          refundRecords.length,
+
+        amountPaidCents:
+          invoice.amountPaidCents,
+
+        amountRefundedCents:
+          invoice.amountRefundedCents,
+
+        refundableAmountCents:
+          invoice.refundableAmountCents,
+
+        netCollectedCents:
+          invoice.netCollectedCents,
+      });
+
+      return;
+    }
+
+    if (
+      req.method === "POST" &&
+      invoiceRefundsMatch
+    ) {
+      const body =
+        await readJsonBody(req);
+
+      const invoiceId =
+        cleanId(
+          decodeURIComponent(
+            invoiceRefundsMatch[1]
+          ),
+          "invoice"
+        );
+
+      const data = readData();
+
+      const invoice =
+        data.invoices.find(
+          (item) =>
+            item.id === invoiceId
+        );
+
+      if (!invoice) {
+        sendJson(res, 404, {
+          ok: false,
+          error:
+            "Invoice was not found.",
+        });
+
+        return;
+      }
+
+      if (
+        invoice.status !== "PAID"
+      ) {
+        sendJson(res, 409, {
+          ok: false,
+          error:
+            "Refunds can only be recorded against a PAID invoice.",
+          invoiceStatus:
+            invoice.status,
+        });
+
+        return;
+      }
+
+      const amountPaidCents =
+        nonnegativeInteger(
+          invoice.amountPaidCents
+        );
+
+      const amountRefundedCents =
+        nonnegativeInteger(
+          invoice.amountRefundedCents
+        );
+
+      const refundableAmountCents =
+        Math.max(
+          0,
+          amountPaidCents -
+            amountRefundedCents
+        );
+
+      if (
+        amountPaidCents <= 0 ||
+        refundableAmountCents <= 0
+      ) {
+        sendJson(res, 409, {
+          ok: false,
+          error:
+            "This invoice has no refundable payment balance.",
+        });
+
+        return;
+      }
+
+      const amountCents =
+        Number(
+          body.amountCents
+        );
+
+      if (
+        !Number.isSafeInteger(
+          amountCents
+        ) ||
+        amountCents <= 0
+      ) {
+        sendJson(res, 400, {
+          ok: false,
+          error:
+            "Refund amountCents must be a positive whole-cent amount.",
+        });
+
+        return;
+      }
+
+      if (
+        amountCents >
+        refundableAmountCents
+      ) {
+        sendJson(res, 409, {
+          ok: false,
+          error:
+            "The recorded refund cannot exceed the refundable payment balance.",
+          refundableAmountCents,
+        });
+
+        return;
+      }
+
+      const refundReference =
+        cleanText(
+          body.refundReference,
+          200
+        );
+
+      if (!refundReference) {
+        sendJson(res, 400, {
+          ok: false,
+          error:
+            "A refundReference is required.",
+        });
+
+        return;
+      }
+
+      const refundMethod =
+        cleanText(
+          body.refundMethod,
+          60
+        ).toUpperCase();
+
+      const refundProvider =
+        cleanText(
+          body.refundProvider ||
+            "MANUAL",
+          80
+        ).toUpperCase();
+
+      const allowedMethods =
+        new Set([
+          "ORIGINAL_METHOD",
+          "ACH",
+          "WIRE",
+          "CHECK",
+          "CARD",
+          "CASH",
+          "OTHER",
+        ]);
+
+      const allowedProviders =
+        new Set([
+          "MANUAL",
+          "STRIPE",
+          "PAYPAL",
+          "BANK",
+          "OTHER",
+        ]);
+
+      if (
+        !allowedMethods.has(
+          refundMethod
+        )
+      ) {
+        sendJson(res, 400, {
+          ok: false,
+          error:
+            "Unknown refund method.",
+          allowedMethods:
+            Array.from(
+              allowedMethods
+            ),
+        });
+
+        return;
+      }
+
+      if (
+        !allowedProviders.has(
+          refundProvider
+        )
+      ) {
+        sendJson(res, 400, {
+          ok: false,
+          error:
+            "Unknown refund provider.",
+          allowedProviders:
+            Array.from(
+              allowedProviders
+            ),
+        });
+
+        return;
+      }
+
+      const externalRefundId =
+        cleanText(
+          body.externalRefundId ||
+            body.refundProviderId ||
+            body.transactionId,
+          200
+        );
+
+      if (
+        refundProvider !==
+          "MANUAL" &&
+        !externalRefundId
+      ) {
+        sendJson(res, 400, {
+          ok: false,
+          error:
+            "An externalRefundId is required for non-manual refund providers.",
+        });
+
+        return;
+      }
+
+      const refundReason =
+        cleanText(
+          body.refundReason,
+          1000
+        );
+
+      if (refundReason.length < 8) {
+        sendJson(res, 400, {
+          ok: false,
+          error:
+            "A meaningful refund reason is required.",
+        });
+
+        return;
+      }
+
+      const evidenceNote =
+        cleanText(
+          body.evidenceNote,
+          2000
+        );
+
+      if (evidenceNote.length < 8) {
+        sendJson(res, 400, {
+          ok: false,
+          error:
+            "A meaningful refund evidence note is required.",
+        });
+
+        return;
+      }
+
+      if (body.attestation !== true) {
+        sendJson(res, 400, {
+          ok: false,
+          error:
+            "Refund evidence attestation must be accepted.",
+        });
+
+        return;
+      }
+
+      const requestedRefundedAt =
+        cleanText(
+          body.refundedAt,
+          80
+        );
+
+      const refundedAt =
+        requestedRefundedAt
+          ? nullableIso(
+              requestedRefundedAt
+            )
+          : nowIso();
+
+      if (
+        requestedRefundedAt &&
+        !refundedAt
+      ) {
+        sendJson(res, 400, {
+          ok: false,
+          error:
+            "refundedAt must contain a valid date and time.",
+        });
+
+        return;
+      }
+
+      const currency =
+        cleanText(
+          body.currency ||
+            invoice.currency ||
+            "USD",
+          10
+        ).toUpperCase();
+
+      if (
+        currency !==
+        invoice.currency
+      ) {
+        sendJson(res, 409, {
+          ok: false,
+          error:
+            "Refund currency must match the invoice currency.",
+          invoiceCurrency:
+            invoice.currency,
+        });
+
+        return;
+      }
+
+      const allRefundRecords =
+        data.invoices.flatMap(
+          (item) =>
+            Array.isArray(
+              item.refundRecords
+            )
+              ? item.refundRecords
+              : []
+        );
+
+      const duplicateReference =
+        allRefundRecords.find(
+          (item) =>
+            item.refundReference &&
+            item.refundReference
+              .toLowerCase() ===
+            refundReference
+              .toLowerCase()
+        );
+
+      if (duplicateReference) {
+        sendJson(res, 409, {
+          ok: false,
+          error:
+            "The refund reference has already been recorded.",
+          refundRecord:
+            duplicateReference,
+        });
+
+        return;
+      }
+
+      if (externalRefundId) {
+        const duplicateExternalRefund =
+          allRefundRecords.find(
+            (item) =>
+              item.externalRefundId &&
+              item.externalRefundId
+                .toLowerCase() ===
+              externalRefundId
+                .toLowerCase()
+          );
+
+        if (duplicateExternalRefund) {
+          sendJson(res, 409, {
+            ok: false,
+            error:
+              "The external refund has already been recorded.",
+            refundRecord:
+              duplicateExternalRefund,
+          });
+
+          return;
+        }
+      }
+
+      const timestamp = nowIso();
+
+      const refundRecord =
+        normalizeRefundRecord(
+          {
+            id:
+              "refund-record-" +
+              crypto.randomUUID(),
+
+            invoiceId:
+              invoice.id,
+
+            amountCents,
+            currency,
+            refundMethod,
+            refundProvider,
+            refundReference,
+            externalRefundId,
+            refundReason,
+            refundedAt,
+
+            recordedAt:
+              timestamp,
+
+            recordedBy:
+              auth.actor,
+
+            evidenceNote,
+            attestation: true,
+          },
+
+          Array.isArray(
+            invoice.refundRecords
+          )
+            ? invoice.refundRecords.length
+            : 0,
+
+          invoice.id,
+          invoice.currency
+        );
+
+      invoice.refundRecords =
+        Array.isArray(
+          invoice.refundRecords
+        )
+          ? invoice.refundRecords
+          : [];
+
+      invoice.refundRecords.unshift(
+        refundRecord
+      );
+
+      invoice.amountRefundedCents =
+        amountRefundedCents +
+        amountCents;
+
+      invoice.refundableAmountCents =
+        Math.max(
+          0,
+          amountPaidCents -
+            invoice.amountRefundedCents
+        );
+
+      invoice.netCollectedCents =
+        invoice.refundableAmountCents;
+
+      const previousStatus =
+        invoice.status;
+
+      if (
+        invoice.refundableAmountCents ===
+        0
+      ) {
+        invoice.status =
+          "REFUNDED";
+
+        invoice.refundedAt =
+          refundedAt;
+      }
+      else {
+        invoice.status =
+          "PAID";
+
+        invoice.refundedAt = "";
+      }
+
+      invoice.lastRefundAt =
+        refundedAt;
+
+      invoice.updatedBy =
+        auth.actor;
+
+      invoice.updatedAt =
+        timestamp;
+
+      addAudit(
+        data,
+        "INVOICE_REFUND_RECORDED",
+        auth.actor,
+        invoice.id +
+          ": " +
+          amountCents +
+          ": " +
+          refundReference
+      );
+
+      if (
+        previousStatus !==
+        invoice.status
+      ) {
+        addAudit(
+          data,
+          "INVOICE_STATUS_UPDATED",
+          auth.actor,
+          invoice.id +
+            ": " +
+            previousStatus +
+            " -> " +
+            invoice.status
+        );
+      }
+
+      const saved =
+        writeData(data);
+
+      const savedInvoice =
+        saved.invoices.find(
+          (item) =>
+            item.id === invoice.id
+        );
+
+      sendJson(res, 201, {
+        ok: true,
+
+        refundRecord:
+          savedInvoice
+            ?.refundRecords
+            ?.find(
+              (item) =>
+                item.id ===
+                refundRecord.id
             ),
 
         invoice:
