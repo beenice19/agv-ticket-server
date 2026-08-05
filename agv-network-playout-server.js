@@ -825,6 +825,88 @@ function normalizeSchedulePlacement(
   };
 }
 
+function normalizePaymentRecord(
+  item,
+  index,
+  invoiceId,
+  invoiceCurrency
+) {
+  const source =
+    item && typeof item === "object"
+      ? item
+      : {};
+
+  return {
+    id: cleanId(
+      source.id,
+      "payment-record-" + (index + 1)
+    ),
+
+    invoiceId: cleanText(
+      source.invoiceId ||
+        invoiceId,
+      160
+    ),
+
+    status: "RECORDED",
+
+    amountCents:
+      nonnegativeInteger(
+        source.amountCents
+      ),
+
+    currency: cleanText(
+      source.currency ||
+        invoiceCurrency ||
+        "USD",
+      10
+    ).toUpperCase(),
+
+    paymentMethod: cleanText(
+      source.paymentMethod ||
+        "OTHER",
+      60
+    ).toUpperCase(),
+
+    paymentProvider: cleanText(
+      source.paymentProvider ||
+        "MANUAL",
+      80
+    ).toUpperCase(),
+
+    paymentReference: cleanText(
+      source.paymentReference,
+      200
+    ),
+
+    externalTransactionId:
+      cleanText(
+        source.externalTransactionId,
+        200
+      ),
+
+    receivedAt:
+      nullableIso(source.receivedAt),
+
+    recordedAt:
+      nullableIso(source.recordedAt) ||
+      nowIso(),
+
+    recordedBy: cleanText(
+      source.recordedBy,
+      254
+    ),
+
+    evidenceNote: cleanText(
+      source.evidenceNote,
+      2000
+    ),
+
+    attestation:
+      source.attestation === true,
+  };
+}
+
 function normalizeInvoice(item, index) {
   const source =
     item && typeof item === "object"
@@ -852,10 +934,55 @@ function normalizeInvoice(item, index) {
         subtotalCents + taxCents
     );
 
-  const amountPaidCents =
-    nonnegativeInteger(
-      source.amountPaidCents
+  const paymentRecordSource =
+    Array.isArray(
+      source.paymentRecords
+    )
+      ? source.paymentRecords
+      : [];
+
+  const invoiceIdForRecords =
+    cleanText(
+      source.id,
+      160
     );
+
+  const invoiceCurrency =
+    cleanText(
+      source.currency || "USD",
+      10
+    ).toUpperCase();
+
+  const paymentRecords =
+    paymentRecordSource.map(
+      (paymentRecord, paymentIndex) =>
+        normalizePaymentRecord(
+          paymentRecord,
+          paymentIndex,
+          invoiceIdForRecords,
+          invoiceCurrency
+        )
+    );
+
+  const recordedPaymentTotalCents =
+    paymentRecords.reduce(
+      (sum, paymentRecord) =>
+        sum +
+        nonnegativeInteger(
+          paymentRecord.amountCents
+        ),
+      0
+    );
+
+  const amountPaidCents =
+    paymentRecords.length > 0
+      ? Math.min(
+          totalCents,
+          recordedPaymentTotalCents
+        )
+      : nonnegativeInteger(
+          source.amountPaidCents
+        );
 
   return {
     id: cleanId(
@@ -891,6 +1018,7 @@ function normalizeInvoice(item, index) {
     amountPaidCents,
 
     balanceDueCents:
+      paymentRecords.length > 0 ||
       source.balanceDueCents ===
       undefined
         ? Math.max(
@@ -915,6 +1043,19 @@ function normalizeInvoice(item, index) {
 
     paidAt:
       nullableIso(source.paidAt),
+
+    paymentRecords,
+
+    lastPaymentAt:
+      nullableIso(
+        source.lastPaymentAt
+      ) ||
+      (paymentRecords.length > 0
+        ? paymentRecords[0]
+            .receivedAt ||
+          paymentRecords[0]
+            .recordedAt
+        : ""),
 
     notes: cleanText(
       source.notes,
@@ -3314,6 +3455,554 @@ async function handleRequest(
               item.id ===
               campaign.id
           ),
+      });
+
+      return;
+    }
+
+    // PASS ANPE-02G1B — CONTROLLED PAYMENT-RECORDING ROUTES
+    // Records external payment evidence only. No processor or checkout calls.
+    const invoicePaymentsMatch =
+      pathname.match(
+        /^\/api\/admin\/commercial\/invoices\/([^/]+)\/payments$/
+      );
+
+    if (
+      req.method === "GET" &&
+      invoicePaymentsMatch
+    ) {
+      const invoiceId =
+        cleanId(
+          decodeURIComponent(
+            invoicePaymentsMatch[1]
+          ),
+          "invoice"
+        );
+
+      const data = readData();
+
+      const invoice =
+        data.invoices.find(
+          (item) =>
+            item.id === invoiceId
+        );
+
+      if (!invoice) {
+        sendJson(res, 404, {
+          ok: false,
+          error:
+            "Invoice was not found.",
+        });
+
+        return;
+      }
+
+      const paymentRecords =
+        Array.isArray(
+          invoice.paymentRecords
+        )
+          ? invoice.paymentRecords
+          : [];
+
+      sendJson(res, 200, {
+        ok: true,
+        invoiceId:
+          invoice.id,
+        paymentRecords,
+        count:
+          paymentRecords.length,
+        amountPaidCents:
+          invoice.amountPaidCents,
+        balanceDueCents:
+          invoice.balanceDueCents,
+      });
+
+      return;
+    }
+
+    if (
+      req.method === "POST" &&
+      invoicePaymentsMatch
+    ) {
+      const body =
+        await readJsonBody(req);
+
+      const invoiceId =
+        cleanId(
+          decodeURIComponent(
+            invoicePaymentsMatch[1]
+          ),
+          "invoice"
+        );
+
+      const data = readData();
+
+      const invoice =
+        data.invoices.find(
+          (item) =>
+            item.id === invoiceId
+        );
+
+      if (!invoice) {
+        sendJson(res, 404, {
+          ok: false,
+          error:
+            "Invoice was not found.",
+        });
+
+        return;
+      }
+
+      if (
+        invoice.status !== "ISSUED" &&
+        invoice.status !==
+          "PARTIALLY_PAID" &&
+        invoice.status !==
+          "PAST_DUE"
+      ) {
+        sendJson(res, 409, {
+          ok: false,
+          error:
+            "Payments can only be recorded against an ISSUED, PARTIALLY_PAID, or PAST_DUE invoice.",
+          invoiceStatus:
+            invoice.status,
+        });
+
+        return;
+      }
+
+      const amountCents =
+        Number(
+          body.amountCents
+        );
+
+      if (
+        !Number.isSafeInteger(
+          amountCents
+        ) ||
+        amountCents <= 0
+      ) {
+        sendJson(res, 400, {
+          ok: false,
+          error:
+            "Payment amountCents must be a positive whole-cent amount.",
+        });
+
+        return;
+      }
+
+      const currentBalance =
+        nonnegativeInteger(
+          invoice.balanceDueCents ===
+          undefined
+            ? invoice.totalCents -
+                invoice.amountPaidCents
+            : invoice.balanceDueCents
+        );
+
+      if (currentBalance <= 0) {
+        sendJson(res, 409, {
+          ok: false,
+          error:
+            "This invoice has no remaining balance.",
+        });
+
+        return;
+      }
+
+      if (
+        amountCents >
+        currentBalance
+      ) {
+        sendJson(res, 409, {
+          ok: false,
+          error:
+            "The recorded payment cannot exceed the invoice balance.",
+          balanceDueCents:
+            currentBalance,
+        });
+
+        return;
+      }
+
+      const paymentReference =
+        cleanText(
+          body.paymentReference,
+          200
+        );
+
+      if (!paymentReference) {
+        sendJson(res, 400, {
+          ok: false,
+          error:
+            "A paymentReference is required.",
+        });
+
+        return;
+      }
+
+      const paymentMethod =
+        cleanText(
+          body.paymentMethod,
+          60
+        ).toUpperCase();
+
+      const paymentProvider =
+        cleanText(
+          body.paymentProvider ||
+            "MANUAL",
+          80
+        ).toUpperCase();
+
+      const allowedMethods =
+        new Set([
+          "ACH",
+          "WIRE",
+          "CHECK",
+          "CARD",
+          "CASH",
+          "OTHER",
+        ]);
+
+      const allowedProviders =
+        new Set([
+          "MANUAL",
+          "STRIPE",
+          "PAYPAL",
+          "BANK",
+          "OTHER",
+        ]);
+
+      if (
+        !allowedMethods.has(
+          paymentMethod
+        )
+      ) {
+        sendJson(res, 400, {
+          ok: false,
+          error:
+            "Unknown payment method.",
+          allowedMethods:
+            Array.from(
+              allowedMethods
+            ),
+        });
+
+        return;
+      }
+
+      if (
+        !allowedProviders.has(
+          paymentProvider
+        )
+      ) {
+        sendJson(res, 400, {
+          ok: false,
+          error:
+            "Unknown payment provider.",
+          allowedProviders:
+            Array.from(
+              allowedProviders
+            ),
+        });
+
+        return;
+      }
+
+      const externalTransactionId =
+        cleanText(
+          body.externalTransactionId ||
+            body.transactionId ||
+            body.paymentProviderId,
+          200
+        );
+
+      if (
+        paymentProvider !==
+          "MANUAL" &&
+        !externalTransactionId
+      ) {
+        sendJson(res, 400, {
+          ok: false,
+          error:
+            "An externalTransactionId is required for non-manual payment providers.",
+        });
+
+        return;
+      }
+
+      const evidenceNote =
+        cleanText(
+          body.evidenceNote,
+          2000
+        );
+
+      if (evidenceNote.length < 8) {
+        sendJson(res, 400, {
+          ok: false,
+          error:
+            "A meaningful payment evidence note is required.",
+        });
+
+        return;
+      }
+
+      if (body.attestation !== true) {
+        sendJson(res, 400, {
+          ok: false,
+          error:
+            "Payment evidence attestation must be accepted.",
+        });
+
+        return;
+      }
+
+      const requestedReceivedAt =
+        cleanText(
+          body.receivedAt,
+          80
+        );
+
+      const receivedAt =
+        requestedReceivedAt
+          ? nullableIso(
+              requestedReceivedAt
+            )
+          : nowIso();
+
+      if (
+        requestedReceivedAt &&
+        !receivedAt
+      ) {
+        sendJson(res, 400, {
+          ok: false,
+          error:
+            "receivedAt must contain a valid date and time.",
+        });
+
+        return;
+      }
+
+      const currency =
+        cleanText(
+          body.currency ||
+            invoice.currency ||
+            "USD",
+          10
+        ).toUpperCase();
+
+      if (
+        currency !==
+        invoice.currency
+      ) {
+        sendJson(res, 409, {
+          ok: false,
+          error:
+            "Payment currency must match the invoice currency.",
+          invoiceCurrency:
+            invoice.currency,
+        });
+
+        return;
+      }
+
+      const allPaymentRecords =
+        data.invoices.flatMap(
+          (item) =>
+            Array.isArray(
+              item.paymentRecords
+            )
+              ? item.paymentRecords
+              : []
+        );
+
+      const duplicateReference =
+        allPaymentRecords.find(
+          (item) =>
+            item.paymentReference &&
+            item.paymentReference
+              .toLowerCase() ===
+            paymentReference
+              .toLowerCase()
+        );
+
+      if (duplicateReference) {
+        sendJson(res, 409, {
+          ok: false,
+          error:
+            "The payment reference has already been recorded.",
+          paymentRecord:
+            duplicateReference,
+        });
+
+        return;
+      }
+
+      if (externalTransactionId) {
+        const duplicateTransaction =
+          allPaymentRecords.find(
+            (item) =>
+              item.externalTransactionId &&
+              item.externalTransactionId
+                .toLowerCase() ===
+              externalTransactionId
+                .toLowerCase()
+          );
+
+        if (duplicateTransaction) {
+          sendJson(res, 409, {
+            ok: false,
+            error:
+              "The external transaction has already been recorded.",
+            paymentRecord:
+              duplicateTransaction,
+          });
+
+          return;
+        }
+      }
+
+      const timestamp = nowIso();
+
+      const paymentRecord =
+        normalizePaymentRecord(
+          {
+            id:
+              "payment-record-" +
+              crypto.randomUUID(),
+
+            invoiceId:
+              invoice.id,
+
+            amountCents,
+            currency,
+            paymentMethod,
+            paymentProvider,
+            paymentReference,
+            externalTransactionId,
+            receivedAt,
+
+            recordedAt:
+              timestamp,
+
+            recordedBy:
+              auth.actor,
+
+            evidenceNote,
+            attestation: true,
+          },
+
+          Array.isArray(
+            invoice.paymentRecords
+          )
+            ? invoice.paymentRecords.length
+            : 0,
+
+          invoice.id,
+          invoice.currency
+        );
+
+      invoice.paymentRecords =
+        Array.isArray(
+          invoice.paymentRecords
+        )
+          ? invoice.paymentRecords
+          : [];
+
+      invoice.paymentRecords.unshift(
+        paymentRecord
+      );
+
+      invoice.amountPaidCents =
+        nonnegativeInteger(
+          invoice.amountPaidCents
+        ) + amountCents;
+
+      invoice.balanceDueCents =
+        Math.max(
+          0,
+          nonnegativeInteger(
+            invoice.totalCents
+          ) -
+          invoice.amountPaidCents
+        );
+
+      const previousStatus =
+        invoice.status;
+
+      if (
+        invoice.balanceDueCents === 0
+      ) {
+        invoice.status = "PAID";
+        invoice.paidAt =
+          receivedAt;
+      }
+      else {
+        invoice.status =
+          "PARTIALLY_PAID";
+
+        invoice.paidAt = "";
+      }
+
+      invoice.lastPaymentAt =
+        receivedAt;
+
+      invoice.updatedBy =
+        auth.actor;
+
+      invoice.updatedAt =
+        timestamp;
+
+      addAudit(
+        data,
+        "INVOICE_PAYMENT_RECORDED",
+        auth.actor,
+        invoice.id +
+          ": " +
+          amountCents +
+          ": " +
+          paymentReference
+      );
+
+      if (
+        previousStatus !==
+        invoice.status
+      ) {
+        addAudit(
+          data,
+          "INVOICE_STATUS_UPDATED",
+          auth.actor,
+          invoice.id +
+            ": " +
+            previousStatus +
+            " -> " +
+            invoice.status
+        );
+      }
+
+      const saved =
+        writeData(data);
+
+      const savedInvoice =
+        saved.invoices.find(
+          (item) =>
+            item.id === invoice.id
+        );
+
+      sendJson(res, 201, {
+        ok: true,
+
+        paymentRecord:
+          savedInvoice
+            ?.paymentRecords
+            ?.find(
+              (item) =>
+                item.id ===
+                paymentRecord.id
+            ),
+
+        invoice:
+          savedInvoice,
       });
 
       return;
