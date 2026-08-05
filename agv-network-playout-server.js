@@ -2312,6 +2312,589 @@ async function handleRequest(
       return;
     }
 
+    // PASS ANPE-02E1B — ADMIN SCHEDULE-PLACEMENT WORKFLOW ROUTES
+    // Administrative scheduling only. Playout remains disabled.
+    if (
+      req.method === "GET" &&
+      pathname ===
+        "/api/admin/commercial/schedule-placements"
+    ) {
+      const data = readData();
+
+      const campaignId = cleanText(
+        url.searchParams.get("campaignId"),
+        160
+      );
+
+      const contractId = cleanText(
+        url.searchParams.get("contractId"),
+        160
+      );
+
+      const stationId = cleanText(
+        url.searchParams.get("stationId"),
+        160
+      );
+
+      const statusFilter = cleanText(
+        url.searchParams.get("status"),
+        60
+      ).toUpperCase();
+
+      const schedulePlacements =
+        data.schedulePlacements.filter(
+          (item) =>
+            (!campaignId ||
+              item.campaignId ===
+                campaignId) &&
+            (!contractId ||
+              item.contractId ===
+                contractId) &&
+            (!stationId ||
+              item.stationId ===
+                stationId) &&
+            (!statusFilter ||
+              item.status ===
+                statusFilter)
+        );
+
+      sendJson(res, 200, {
+        ok: true,
+        schedulePlacements,
+        count:
+          schedulePlacements.length,
+      });
+
+      return;
+    }
+
+    if (
+      req.method === "POST" &&
+      pathname ===
+        "/api/admin/commercial/schedule-placements"
+    ) {
+      const body =
+        await readJsonBody(req);
+
+      const campaignId = cleanText(
+        body.campaignId,
+        160
+      );
+
+      const contractId = cleanText(
+        body.contractId,
+        160
+      );
+
+      if (!campaignId) {
+        sendJson(res, 400, {
+          ok: false,
+          error:
+            "A campaignId is required.",
+        });
+
+        return;
+      }
+
+      if (!contractId) {
+        sendJson(res, 400, {
+          ok: false,
+          error:
+            "A contractId is required.",
+        });
+
+        return;
+      }
+
+      const data = readData();
+
+      const campaign =
+        data.campaigns.find(
+          (item) =>
+            item.id === campaignId
+        );
+
+      if (!campaign) {
+        sendJson(res, 404, {
+          ok: false,
+          error:
+            "Campaign was not found.",
+        });
+
+        return;
+      }
+
+      const contract =
+        data.contracts.find(
+          (item) =>
+            item.id === contractId
+        );
+
+      if (!contract) {
+        sendJson(res, 404, {
+          ok: false,
+          error:
+            "Contract was not found.",
+        });
+
+        return;
+      }
+
+      if (
+        contract.campaignId !==
+        campaign.id
+      ) {
+        sendJson(res, 409, {
+          ok: false,
+          error:
+            "The contract does not belong to this campaign.",
+        });
+
+        return;
+      }
+
+      if (
+        contract.status !== "SIGNED" &&
+        contract.status !==
+          "ACTIVE"
+      ) {
+        sendJson(res, 409, {
+          ok: false,
+          error:
+            "The contract must be SIGNED or ACTIVE before airtime can be scheduled.",
+          contractStatus:
+            contract.status,
+        });
+
+        return;
+      }
+
+      const scheduledStartAt =
+        nullableIso(
+          body.scheduledStartAt ||
+            body.startAt
+        );
+
+      const scheduledEndAt =
+        nullableIso(
+          body.scheduledEndAt ||
+            body.endAt
+        );
+
+      if (
+        !scheduledStartAt ||
+        !scheduledEndAt
+      ) {
+        sendJson(res, 400, {
+          ok: false,
+          error:
+            "Valid scheduledStartAt and scheduledEndAt values are required.",
+        });
+
+        return;
+      }
+
+      const startMs =
+        Date.parse(
+          scheduledStartAt
+        );
+
+      const endMs =
+        Date.parse(
+          scheduledEndAt
+        );
+
+      if (
+        !Number.isFinite(startMs) ||
+        !Number.isFinite(endMs) ||
+        endMs <= startMs
+      ) {
+        sendJson(res, 400, {
+          ok: false,
+          error:
+            "The scheduled end time must be after the scheduled start time.",
+        });
+
+        return;
+      }
+
+      const stationId = cleanId(
+        body.stationId ||
+          campaign.stationId,
+        "station"
+      );
+
+      const conflictingPlacement =
+        data.schedulePlacements.find(
+          (item) => {
+            if (
+              item.stationId !==
+                stationId ||
+              item.status === "CANCELLED" ||
+              item.status === "MISSED" ||
+              !item.scheduledStartAt ||
+              !item.scheduledEndAt
+            ) {
+              return false;
+            }
+
+            const existingStart =
+              Date.parse(
+                item.scheduledStartAt
+              );
+
+            const existingEnd =
+              Date.parse(
+                item.scheduledEndAt
+              );
+
+            return (
+              Number.isFinite(
+                existingStart
+              ) &&
+              Number.isFinite(
+                existingEnd
+              ) &&
+              startMs < existingEnd &&
+              endMs > existingStart
+            );
+          }
+        );
+
+      if (conflictingPlacement) {
+        sendJson(res, 409, {
+          ok: false,
+          error:
+            "The requested airtime overlaps an existing placement on this station.",
+          conflictingPlacement,
+        });
+
+        return;
+      }
+
+      const timestamp = nowIso();
+
+      const placement =
+        normalizeSchedulePlacement(
+          {
+            ...body,
+
+            id:
+              body.id ||
+              `schedule-placement-${crypto.randomUUID()}`,
+
+            campaignId:
+              campaign.id,
+
+            contractId:
+              contract.id,
+
+            stationId,
+
+            programId:
+              body.programId ||
+              campaign.programId,
+
+            offerId:
+              body.offerId ||
+              campaign.offerId,
+
+            placementType:
+              body.placementType ||
+              campaign.offerType ||
+              "AIRTIME_SPOT",
+
+            scheduledStartAt,
+            scheduledEndAt,
+
+            durationSeconds:
+              Math.max(
+                1,
+                Math.round(
+                  (endMs - startMs) /
+                    1000
+                )
+              ),
+
+            status: "DRAFT",
+
+            createdBy:
+              auth.actor,
+
+            updatedBy:
+              auth.actor,
+
+            createdAt:
+              timestamp,
+
+            updatedAt:
+              timestamp,
+          },
+
+          data.schedulePlacements.length
+        );
+
+      data.schedulePlacements.unshift(
+        placement
+      );
+
+      campaign.schedulePlacementIds =
+        Array.from(
+          new Set([
+            placement.id,
+            ...campaign.schedulePlacementIds,
+          ])
+        );
+
+      campaign.updatedBy =
+        auth.actor;
+
+      campaign.updatedAt =
+        timestamp;
+
+      addAudit(
+        data,
+        "SCHEDULE_PLACEMENT_CREATED",
+        auth.actor,
+        `${placement.id}: ${campaign.id}: ${stationId}`
+      );
+
+      const saved =
+        writeData(data);
+
+      sendJson(res, 201, {
+        ok: true,
+
+        schedulePlacement:
+          saved.schedulePlacements.find(
+            (item) =>
+              item.id ===
+              placement.id
+          ),
+
+        campaign:
+          saved.campaigns.find(
+            (item) =>
+              item.id ===
+              campaign.id
+          ),
+      });
+
+      return;
+    }
+
+    const scheduleStatusMatch =
+      pathname.match(
+        /^\/api\/admin\/commercial\/schedule-placements\/([^/]+)\/status$/
+      );
+
+    if (
+      req.method === "PATCH" &&
+      scheduleStatusMatch
+    ) {
+      const body =
+        await readJsonBody(req);
+
+      const requestedStatus =
+        cleanText(
+          body.status,
+          60
+        ).toUpperCase();
+
+      if (
+        !SCHEDULE_PLACEMENT_STATUSES.has(
+          requestedStatus
+        )
+      ) {
+        sendJson(res, 400, {
+          ok: false,
+          error:
+            "Unknown schedule-placement status.",
+
+          allowedStatuses:
+            Array.from(
+              SCHEDULE_PLACEMENT_STATUSES
+            ),
+        });
+
+        return;
+      }
+
+      const placementId =
+        cleanId(
+          decodeURIComponent(
+            scheduleStatusMatch[1]
+          ),
+          "schedule-placement"
+        );
+
+      const data = readData();
+
+      const placement =
+        data.schedulePlacements.find(
+          (item) =>
+            item.id === placementId
+        );
+
+      if (!placement) {
+        sendJson(res, 404, {
+          ok: false,
+          error:
+            "Schedule placement was not found.",
+        });
+
+        return;
+      }
+
+      if (
+        requestedStatus === "AIRED" &&
+        data.playoutEnabled !== true
+      ) {
+        sendJson(res, 409, {
+          ok: false,
+          error:
+            "AIRED status is unavailable until certified playout and proof-of-play activation.",
+        });
+
+        return;
+      }
+
+      const contract =
+        data.contracts.find(
+          (item) =>
+            item.id ===
+            placement.contractId
+        );
+
+      if (
+        (requestedStatus ===
+          "CONFIRMED" ||
+          requestedStatus ===
+          "SCHEDULED") &&
+        (!contract ||
+          (contract.status !== "SIGNED" &&
+            contract.status !==
+              "ACTIVE"))
+      ) {
+        sendJson(res, 409, {
+          ok: false,
+          error:
+            "A SIGNED or ACTIVE contract is required before confirming or scheduling airtime.",
+        });
+
+        return;
+      }
+
+      if (
+        requestedStatus ===
+          "CONFIRMED" ||
+        requestedStatus ===
+          "SCHEDULED"
+      ) {
+        const startMs =
+          Date.parse(
+            placement.scheduledStartAt
+          );
+
+        const endMs =
+          Date.parse(
+            placement.scheduledEndAt
+          );
+
+        const conflict =
+          data.schedulePlacements.find(
+            (item) => {
+              if (
+                item.id ===
+                  placement.id ||
+                item.stationId !==
+                  placement.stationId ||
+                item.status === "CANCELLED" ||
+                item.status === "MISSED" ||
+                !item.scheduledStartAt ||
+                !item.scheduledEndAt
+              ) {
+                return false;
+              }
+
+              const existingStart =
+                Date.parse(
+                  item.scheduledStartAt
+                );
+
+              const existingEnd =
+                Date.parse(
+                  item.scheduledEndAt
+                );
+
+              return (
+                Number.isFinite(
+                  startMs
+                ) &&
+                Number.isFinite(
+                  endMs
+                ) &&
+                Number.isFinite(
+                  existingStart
+                ) &&
+                Number.isFinite(
+                  existingEnd
+                ) &&
+                startMs < existingEnd &&
+                endMs > existingStart
+              );
+            }
+          );
+
+        if (conflict) {
+          sendJson(res, 409, {
+            ok: false,
+            error:
+              "This airtime conflicts with another placement on the station.",
+            conflictingPlacement:
+              conflict,
+          });
+
+          return;
+        }
+      }
+
+      const previousStatus =
+        placement.status;
+
+      placement.status =
+        requestedStatus;
+
+      placement.updatedBy =
+        auth.actor;
+
+      placement.updatedAt =
+        nowIso();
+
+      addAudit(
+        data,
+        "SCHEDULE_PLACEMENT_STATUS_UPDATED",
+        auth.actor,
+        `${placement.id}: ${previousStatus} -> ${requestedStatus}`
+      );
+
+      const saved =
+        writeData(data);
+
+      sendJson(res, 200, {
+        ok: true,
+
+        schedulePlacement:
+          saved.schedulePlacements.find(
+            (item) =>
+              item.id ===
+              placement.id
+          ),
+      });
+
+      return;
+    }
+
     const statusMatch =
       pathname.match(
         /^\/api\/admin\/commercial\/campaigns\/([^/]+)\/status$/
